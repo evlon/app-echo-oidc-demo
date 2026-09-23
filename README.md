@@ -1,0 +1,169 @@
+# app-echo-oidc-demo —— 企业业务应用接入统一认证的标准示例
+
+> 这是一份**给业务开发人员照抄的模板项目**：把一个普通 HTTP 业务服务，做成
+> **Docker 镜像 → 上公司内网网关（Higress）→ 接公司统一认证（Keycloak OIDC /
+> JWT/JWKS）**，总共分几步、代码怎么写、踩过哪些坑。
+
+**线上体验**：<https://echo.ai.example.com>（登录后回显你的身份；「开发指导」按钮指向门户认证页）。
+
+**开发指导页（门户）**：<https://portal.example.com/auth.html> —— 完整接入文档（架构图 / 时序图 / 运维配置 / 开发指南 / 经验坑）。
+
+---
+
+## 一、这个 demo 解决什么问题
+
+公司要求：业务应用要上内网网关，**登录走公司统一 SSO（Keycloak）**，不许每个应用
+自己弹登录框、自己存密码。那么——
+
+- 用户的登录（OIDC 授权码流程）由 **Higress oidc 插件** + **Keycloak** 在网关层完成，
+  应用**不用自己写登录页**；
+- 应用后端拿到的不是密码，而是**网关注入的身份请求头**（`X-User-*`），直接读「当前是谁」；
+- 机器对机器（API 调用）则用 **JWT + JWKS 验签**，应用后端同样读身份头，不自己验。
+
+本 demo 的 `echo-server.mjs` 就是一个「最小业务后端」：接收身份头、渲染页面/JSON 回显。
+它演示了上面两条链路都怎么对接。
+
+---
+
+## 二、代码里哪些是「业务」，哪些是「对接」？
+
+打开 `echo-server.mjs`，每个函数顶部都标了 `【业务代码】` / `【对接代码】`。
+
+| 代码块 | 类型 | 说明 |
+|---|---|---|
+| `http.createServer` / 路由 / `/health` | **业务** | 任何 Web 应用都有 |
+| `renderJson` | **业务** | 返回 JSON |
+| `renderPage` | **业务** | 渲染 HTML 页面 |
+| `collectIdentity`（读 `X-User-*` 头） | **对接** | 读网关注入的身份 |
+| `unMojibake` | **对接** | 修中文 header 乱码坑 |
+| 退出登录链接 | **对接** | 真正登出 Keycloak SSO |
+| `Cache-Control: no-store` | **对接** | 防缓存导致「假登录」 |
+
+> 一句话：**业务代码 = 你的服务本来要写的；对接代码 = 为了接认证/网关额外加的 4 小块。**
+
+---
+
+## 三、把这个服务做成镜像、上网关、接认证 —— 分几步
+
+### 第 1 步：打专属镜像
+
+见 `Dockerfile` + `build.sh`（在 K8S 节点原生构建 arm64、推送内网镜像仓库）：
+
+```bash
+cd /e/ai-works/app-echo-oidc-demo
+bash build.sh 20260919        # 默认 tag 是当天日期
+```
+
+产物：`registry.example.com/library/echo-oidc-demo:20260919`
+
+### 第 2 步：部署到 K8S
+
+见 `deploy/echo-server.yaml`（Deployment + Service）。关键点：
+
+- 引用**自己的专属镜像**（不是 `node:22-slim + ConfigMap` 挂源码）；
+- 所有 Pod 加 `tolerations: [{operator: Exists}]`（集群无 worker 节点）。
+
+```bash
+kubectl -n default apply -f deploy/echo-server.yaml
+```
+
+### 第 3 步：在 Higress 建路由（对外暴露域名）
+
+域名 `echo.ai.example.com` 的 Ingress 见 `k8s/business-services/echo-server/echo-ingress.yaml`，
+或直接用 higress-cli / MCP：
+
+```bash
+higress-cli create --name echo --domains echo.ai.example.com \
+    --service k8s-echo.default.dns:80 --cert im-ai-tls
+```
+
+### 第 4 步：接认证（网关侧配置）
+
+这一步是**网关/运维**做的，业务开发把需求提交给运维即可。两种方式：
+
+1. **浏览器登录（OIDC）**：Higress `oidc` 插件 → Keycloak，配置见
+   `docs/认证接入/01-运维-配置手册.md`；
+2. **后端 API（JWT）**：Higress `jwt-auth` 插件（JWKS 验签）+ `claims_to_headers`。
+
+配置好后，应用后端**自动**收到 `X-User-*` 身份头 —— 代码不用改。
+
+---
+
+## 四、给业务开发的常见 Q&A
+
+- **Q：我后端要不要自己存 token/密码？** 不需要。身份由网关校验后以请求头传给你。
+- **Q：用户登出怎么做？** 浏览器场景由网关 `rd` 指向 Keycloak `end_session`（见
+  `02-开发-接入指南.md`）；后端 API 无状态，不涉及登出。
+- **Q：我后端要校验 token 吗？** 在网关后面不用（网关已验）。若你的服务要**绕过网关**
+  或**被外部直接访问**，才需要在应用内用 JWKS 自验（`02` 有示例说明）。
+- **Q：中文姓名乱码？** 用 `unMojibake`（见源码注释）。
+
+---
+
+## 五、进阶：身份透传（第二跳）
+
+上面讲的是**单跳**——客户端直接调你的服务。真实业务常有**服务间调用**：
+`客户端 → 网关 → 服务 A → 服务 B`，此时 B 怎么知道「你是谁」？
+
+**正确姿势**：A 把原始 JWT 透传给网关，由网关对 B 这一跳重新验签注入身份（**不是** A 手动复制身份头）。
+
+| 服务 | 文件 | 说明 |
+|---|---|---|
+| 第一跳（入口） | `echo-a.mjs` | 读原始 JWT（需网关 `keep_token: true`）→ 透传 JWT 调网关的下游域名；**另有浏览器 OIDC 登录页 + 「调用 demo-b」按钮** |
+| 第二跳（被调） | `echo-b.mjs` | = 单跳 echo-server，读网关注入的 `X-User-*` 头即可 |
+
+完整讲解见 `docs/认证接入/07-身份透传-第二跳.md`（含架构图、逐行注释、踩坑记录）。
+
+**线上体验**：
+- **浏览器（系统 A 登录页）**：<https://demo-a.example.com> —— 经公司统一认证（OIDC）登录后，
+  看到「我是谁」页面 + 「调用 demo-b」按钮，点按钮后台持身份 token 经网关调 demo-b，B 也能说出你是谁。
+- **API（纯 JWT）**：<https://demo-a.example.com/api/call-b> —— 带 JWT 访问，返回身份透传 JSON。
+
+### 系统 A 的「有状态前端」形态（OIDC 登录页 + 按钮）
+
+`echo-a.mjs` 除了原有的 `/api/call-b`（透传 JWT），还新增了**浏览器登录页**：
+
+| 路由 | 行为 |
+|---|---|
+| `/` | 渲染 HTML 页面：显示「我是谁」（网关注入 `X-User-*`）+ S1/S2 双按钮 + 退出登录 |
+| `/api/whoami` | 回显第一跳身份（`emp_no` 工号 / `name` / `email` / `sub`），用于真实账号验证身份不衰减 |
+| `/api/call-b` | 按钮点击后调用，透传 JWT 调 demo-b，返回身份透传 JSON |
+| `/health` | K8S 探针 |
+
+网关侧配套：demo-a 域名同时挂 **oidc**（浏览器登录，`client_id=demo-a`）+ **jwt-auth**（API 验签）。
+两者靠 oidc 的 `match_list` 豁免 `/api`、`/health` 分流（见 `gateway/oidc-demo-a.json`）。
+
+---
+
+## 六、目录结构
+
+```
+app-echo-oidc-demo/
+├── echo-server.mjs        # 单跳身份回显（业务 + 对接，已逐块标注）
+├── echo-a.mjs             # 身份透传第一跳（透传 JWT 调下游）
+├── echo-b.mjs             # 身份透传第二跳（读网关注入身份）
+├── verify-transit.mjs     # 端到端验证脚本（本机运行）
+├── package.json
+├── Dockerfile             # 打镜像（一个镜像承载三个服务）
+├── build.sh               # 构建 + 推送镜像仓库
+├── deploy/
+│   ├── echo-server.yaml   # 单跳 K8S Deployment + Service
+│   ├── echo-a.yaml        # 第一跳（含 hostAliases 坑）
+│   └── echo-b.yaml        # 第二跳
+├── gateway/
+│   ├── jwt-auth-echo-a.json      # 第一跳网关配置（keep_token:true）
+│   ├── jwt-auth-echo-b.json      # 第二跳网关配置
+│   ├── jwt-auth-demo-a-keep-token.json  # 实际应用的（复用旧 demo-a 插件名）
+│   ├── jwt-auth-demo-a-s1.json   # S1 路径 jwt-auth（无 keep_token，用于演示 401 教学点）
+│   ├── oidc-demo-a.json          # demo-a 浏览器登录（oidc，match_list 豁免 /api、/health）
+│   └── oidc-demo-a-s1s2.json     # S1/S2 双按钮版 oidc 配置
+└── README.md              # 本文件
+```
+
+配套文档（上级目录）：
+- `docs/认证接入/00-总览-整体情况.md` —— 架构图 / 时序图 / 价值
+- `docs/认证接入/01-运维-配置手册.md` —— 网关/Keycloak 一步步配置
+- `docs/认证接入/02-开发-接入指南.md` —— 业务开发怎么接
+- `docs/认证接入/03-领导-价值说明.md`
+- `docs/认证接入/04-经验与坑.md`
+- `docs/认证接入/07-身份透传-第二跳.md` —— ⭐ 服务间调用身份不衰减（本示例新增）

@@ -1,0 +1,80 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# echo-b —— 「身份透传」链路第二跳（被调服务）
+#
+# echo-b 与 echo-server 几乎完全同构：它只读网关注入的 X-User-* 头，
+# 返回「我知道你是谁」。它不知道、也不需要知道请求是客户端直接来的
+# 还是 echo-a 转发的 —— 身份由网关在入口重新验签注入。
+#
+# ⚠️ K8S Service 名字必须叫 demo-b（理由同 echo-a，匹配路由 backend k8s-demo-b）。
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-b
+  namespace: default
+  labels:
+    app: demo-b
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: demo-b
+  template:
+    metadata:
+      labels:
+        app: demo-b
+    spec:
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: demo-b
+          image: registry.example.com/library/echo-oidc-demo:20260923-s1s2
+          imagePullPolicy: IfNotPresent
+          # 启动 echo-b.mjs（多服务共用一个镜像，用 command 选择）
+          command: ["node", "echo-b.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: TZ
+              value: "Asia/Shanghai"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-b
+  namespace: default
+  labels:
+    app: demo-b
+spec:
+  selector:
+    app: demo-b
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP

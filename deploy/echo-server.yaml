@@ -1,0 +1,88 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# echo-oidc-demo —— 身份回显服务（业务应用接入公司统一认证的标准部署范例）
+#
+# 与旧版（k8s/business-services/echo-server.yaml，ConfigMap 挂源码）的区别：
+#   这次把源码打进专属镜像 echo-oidc-demo 再部署 —— 这才是业务应用的标准形态，
+#   其它开发照抄「build.sh 打镜像 + 这份 deployment 引用镜像」即可。
+#
+# ── 认证链路 ──────────────────────────────────────────────────────────────────
+#   浏览器：Higress oidc 插件 → Keycloak 登录 → 注入 X-User-* → echo
+#   API   ：Bearer JWT → Higress jwt-auth（JWKS 验签）→ 注入 X-User-* → echo
+#
+# ── 无 worker 节点 ────────────────────────────────────────────────────────────
+#   所有 Pod 必须加 tolerations。
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-server
+  namespace: default
+  labels:
+    app: echo-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: echo-server
+  template:
+    metadata:
+      labels:
+        app: echo-server
+    spec:
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: echo-server
+          # ⭐ 改成了专属镜像（由 app-echo-oidc-demo/build.sh 构建并推送）
+          #   20260919-newempno：新增员工编号 new_emp_no 显示（含 token 解析兜底）
+          image: registry.example.com/library/echo-oidc-demo:20260919-newempno
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: TZ
+              value: "Asia/Shanghai"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-server
+  namespace: default
+  labels:
+    app: echo-server
+spec:
+  selector:
+    app: echo-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+
+# 入口 Ingress 由 k8s/business-services/echo-server/echo-ingress.yaml 管理
+# （higress standalone，host: echo.ai.example.com，后端 k8s-echo）

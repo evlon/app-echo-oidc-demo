@@ -1,0 +1,9 @@
+# 构建产物（由 build.sh 生成，不入库）
+.build-stage/
+ctx.tar.gz
+
+# ── 敏感信息红线 ─────────────────────────────────────────────
+# 本仓库只保留「脱敏后的业务代码」。网关插件配置（WasmPlugin JSON，含
+#   client_secret/cookie_secret/jwks）与真实域名/IP 一律不入库。
+# 真实部署用的网关配置/密钥只存在公司部署仓库 (k8s/business-services/) 与 Secret。
+# 提交前自查：grep -rniE "ict\.cmcc|client_secret|cookie_secret|-----BEGIN" --exclude-dir=.git .

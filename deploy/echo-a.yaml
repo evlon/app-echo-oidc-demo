@@ -1,0 +1,107 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# echo-a —— 「身份透传」链路第一跳（入口服务）
+#
+# ⚠️ K8S Service 名字必须叫 demo-a（不是 echo-a）——因为路由 demo-a 的 backend
+# 注解是 k8s-demo-a.default.dns:80，mcpbridges-sync 会按「k8s-<serviceName>.<ns>」
+# 规则把 Service demo-a 映射成 k8s-demo-a.default。若改名则路由 backend 失配 → 503。
+#
+# ── 关键点 ──────────────────────────────────────────────────────────────────────
+#  1. ECHO_B_URL 指向【网关的 demo-b 域名】（https://demo-b.example.com），
+#     不是集群内 DNS（demo-b.default.svc.cluster.local）——后者会绕过网关。
+#  2. 第二跳也走 https，网关证书是内网自签 → 必须挂企业根证书 + NODE_EXTRA_CA_CERTS。
+#  3. 无 worker 节点 → 所有 Pod 加 tolerations。
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-a
+  namespace: default
+  labels:
+    app: demo-a
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: demo-a
+  template:
+    metadata:
+      labels:
+        app: demo-a
+    spec:
+      tolerations:
+        - operator: Exists
+      # ⭐ 关键：让 echo-a Pod 内能解析 demo-b.example.com 到集群内网网关入口
+      #   Pod 内 DNS 不认这个对外域名（getaddrinfo EAI_AGAIN），但 echo-a 调 echo-b
+      #   必须走网关（https://demo-b.example.com），且 SNI 必须是 demo-b 域名才能
+      #   命中 Higress 的 im-ai-tls 证书。所以用 hostAliases 把域名映射到
+      #   edge-gateway 的 ClusterIP（集群内访问 Higress 入口的 Service）。
+      hostAliases:
+        - ip: "10.0.0.10"
+          hostnames:
+            - "demo-b.example.com"
+      containers:
+        - name: demo-a
+          image: registry.example.com/library/echo-oidc-demo:20260923-s1s2
+          imagePullPolicy: IfNotPresent
+          # 启动 echo-a.mjs（多服务共用一个镜像，用 command 选择）
+          command: ["node", "echo-a.mjs"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            # ⭐ 第二跳走网关（demo-b 的对外域名），由网关重新验签注入身份
+            - name: ECHO_B_URL
+              value: "https://demo-b.example.com/api/me"
+            - name: TZ
+              value: "Asia/Shanghai"
+            # ⭐ 内网自签证书 → 让 Node 信任企业根证书（否则 fetch https 报错）
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/etc/ssl/ca/company-root-ca.pem"
+          volumeMounts:
+            - name: ca
+              mountPath: /etc/ssl/ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: ca
+          configMap:
+            name: company-root-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-a
+  namespace: default
+  labels:
+    app: demo-a
+spec:
+  selector:
+    app: demo-a
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
