@@ -407,29 +407,20 @@ function renderPage(identity, jwtPresent) {
     }
   }
   async function callHeaders() {
-    // 🔍 点击即测：依次请求 A/B/C 三跳的 /aiapi/echo-headers，展示每跳实际收到的 HTTP 请求头
-    //   （Authorization / X-Forwarded-Access-Token 已脱敏；X-User-* 是网关注入的身份头）
+    // 🔍 点击即测：走 /ui/headers（oidc 会话），后端用 access token 依次取 A/B/C 三跳各自收到的请求头
     const btn = document.getElementById('headersBtn');
     const out = document.getElementById('headersOut');
     btn.disabled = true;
     out.style.display = 'block';
-    out.textContent = '正在请求 A/B/C 三跳的请求头…';
+    out.textContent = '正在聚合 A/B/C 三跳的请求头…';
     try {
-      const rows = [];
-      // A 这一跳：走 S2 的 oidc 会话路径（浏览器拿得到 access token）
-      const a = await fetch('/aiapi/echo-headers');
-      rows.push('═══ ① A（echo-a）收到的请求头 ═══\\nHTTP ' + a.status + '\\n' + await a.text());
-      // B 这一跳：经 A 透传（带 Bearer）后，B 回显它收到的头
-      const b = await fetch('/aiapi/call-b', { headers: { 'Authorization': 'Bearer ' + (document.getElementById('jwtInput') ? document.getElementById('jwtInput').value.trim() : '') } });
-      // 上面 call-b 会返回 A→B→C 完整链路结果；这里再单独取 B/C 的 echo-headers 需要带 token，浏览器拿不到明文，
-      // 所以改用「S2 会话」路径让 B/C 各自回显（见下方说明）。
-      rows.push('═══ ② B（echo-b）—— 见 A 的返回里的 downstream（B 会继续透传调 C） ═══');
-      // 直接触发 A 的透传链，结果里已含 B 与 C 的身份回显
-      const chain = await fetch('/ui/call-b');
-      rows.push('═══ ③ A → B → C 三跳链结果 ═══\\nHTTP ' + chain.status + '\\n' + await chain.text());
-      setResult(btn, out, rows.join('\\n\\n'));
+      const r = await fetch('/ui/headers');
+      const txt = await r.text();
+      out.textContent = 'HTTP ' + r.status + '\\n\\n' + txt;
     } catch (e) {
-      setResult(btn, out, '请求失败：' + e);
+      out.textContent = '请求失败：' + e;
+    } finally {
+      btn.disabled = false;
     }
   }
   </script>
@@ -530,6 +521,59 @@ const server = http.createServer((req, res) => {
           detail: String(err && err.message || err),
           hint: '检查 ECHO_B_URL 是否指向网关域名、NODE_EXTRA_CA_CERTS 是否挂载',
         }, null, 2))
+      })
+    return
+  }
+
+  // 点击即测：/ui/headers 走 oidc 会话，回显 A/B/C 三跳各自实际收到的请求头
+  // （浏览器点「查看 A/B/C 实际收到的请求头」→ fetch 这里，后端用 access token 依次调 B、C 的 echo-headers）
+  if (url.pathname === '/ui/headers') {
+    const identity = collectIdentity(req)
+    const jwt = extractJwt(req)
+    console.log('[echo-a]', JSON.stringify({ path: '/ui/headers', identity, hasJwt: !!jwt }))
+
+    if (!jwt) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        service: 'echo-a', endpoint: '/ui/headers',
+        error: '未取到 access token（X-Forwarded-Access-Token 缺失）',
+        hint: '请先登录（/ 会自动 302 到 Keycloak），再点按钮。',
+      }, null, 2))
+      return
+    }
+
+    const cUrl = (process.env.ECHO_C_URL || 'https://demo-c.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers')
+    const bUrl = (process.env.ECHO_B_URL || 'https://demo-b.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers')
+
+    async function fetchHeaders(url) {
+      try {
+        const r = await fetch(url, { headers: { Authorization: 'Bearer ' + jwt } })
+        const txt = await r.text()
+        let j; try { j = JSON.parse(txt) } catch { j = txt }
+        return { url, status: r.status, data: j }
+      } catch (e) {
+        return { url, status: 'ERR', error: String(e && e.message || e) }
+      }
+    }
+
+    Promise.all([fetchHeaders(bUrl), fetchHeaders(cUrl)])
+      .then(([bRes, cRes]) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({
+          endpoint: '/ui/headers',
+          note: 'A/B/C 三跳各自实际收到的请求头（Authorization / X-Forwarded-Access-Token 已脱敏）',
+          hop1_echoA: {
+            url: 'https://demo-a.example.com（本服务）',
+            identity,
+            headers: collectHeaders(req),
+          },
+          hop2_echoB: bRes,
+          hop3_echoC: cRes,
+        }, null, 2))
+      })
+      .catch((err) => {
+        res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ service: 'echo-a', error: '聚合 B/C header 失败', detail: String(err && err.message || err) }))
       })
     return
   }
