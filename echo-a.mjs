@@ -54,7 +54,8 @@
  *
  *   S1 与 S2 的本质区别：
  *     - S1 无状态：token 由调用方自己带（Authorization: Bearer），走 jwt-auth 验签；
- *       适合「系统/程序间调用」。浏览器点它必然 401（浏览器拿不到明文 JWT）。
+ *       适合「系统/程序间调用」。点击即测的实现=先经 /api/token（oidc 会话）拿到
+ *       access token，再带 Bearer 直调 /aiapi/call-b（jwt-auth 验签）。
  *     - S2 有状态：token 在 oidc 服务端 cookie，前端 JS 拿不到明文，靠 oidc 插件把
  *       access token 放到 X-Forwarded-Access-Token 头，后端取出透传；适合「人在浏览器点按钮」。
  *
@@ -253,8 +254,15 @@ function renderJson(identity, jwtPresent, bResult) {
  * 兼容）预留的登出端点，插件会清会话 cookie 并（配合 rd 参数）跳转
  * Keycloak 真正登出 SSO。这里 rd 指向 echo 域名兜底（demo 简化）。
  * ═══════════════════════════════════════════════════════════════════════ */
-function renderPage(identity, jwtPresent) {
+function renderPage(identity, jwtPresent, req) {
   const name = identity.name || identity.username || '未知'
+  // 真实域名：页面 curl 示例要用「当前访问的 host」+ 环境变量里的 Keycloak 域名，
+  // 而不是写死 example.com 占位符（否则照着跑会解析失败）。
+  const demoHost = req?.headers?.host || 'demo-a.example.com'
+  const kcBase = process.env.KC_BASE_URL || 'https://auth.example.com'
+  // 门户文档地址（点开直达「身份透传」章节）；demo-a client 的 secret（curl password grant 用）
+  const portalBase = process.env.PORTAL_BASE_URL || 'https://ai.ict.cmcc'
+  const demoASecret = process.env.DEMO_A_CLIENT_SECRET || '<demo-a 的 client secret>'
   const rows = [
     ['用户名 username', identity.username],
     ['姓名 name', identity.name],
@@ -320,31 +328,33 @@ function renderPage(identity, jwtPresent) {
       <tr><th>token 来源</th><td>调用方自带 <code>Authorization: Bearer &lt;JWT&gt;</code></td><td>oidc 插件放 <code>X-Forwarded-Access-Token</code>，后端取出</td></tr>
       <tr><th>适合场景</th><td>系统 / 程序间调用</td><td>人在浏览器里点按钮</td></tr>
     </table>
-    <button id="s1Btn" onclick="callS1()">S1 · API 直调（带 Bearer）</button>
+    <button id="s1Btn" onclick="callS1()">S1 · 点击即测（先拿 token → 带 Bearer 直调）</button>
     <button id="s2Btn" onclick="callS2()">S2 · 浏览器按钮（oidc 会话）</button>
     <button id="headersBtn" onclick="callHeaders()">🔍 查看 A/B/C 实际收到的请求头</button>
     <a class="logout" href="/oauth2/sign_out">退出登录</a>
 
-    <div id="s1Panel" style="display:none;margin-top:16px;border:1px solid #d0d7de;border-radius:6px;padding:14px 16px;">
-      <h3 style="font-size:14px;margin:0 0 10px;color:#1f2328;">S1 · 正确的调用方式（curl / fetch + Bearer）</h3>
-      <p class="muted" style="margin:0 0 8px;">S1 是「系统/程序间直调」：调用方先拿到 JWT，再自带 <code>Authorization: Bearer &lt;JWT&gt;</code> 直调。浏览器里点按钮之所以 401，是因为浏览器拿不到明文 JWT。</p>
+    <div id="s1Panel" style="margin-top:16px;border:1px solid #d0d7de;border-radius:6px;padding:14px 16px;">
+      <h3 style="font-size:14px;margin:0 0 10px;color:#1f2328;">S1 · 正确的调用方式（先拿 token → 再带 Bearer 直调）</h3>
+      <p class="muted" style="margin:0 0 8px;">S1 是「系统/程序间直调」：调用方先拿到 JWT，再自带 <code>Authorization: Bearer &lt;JWT&gt;</code> 直调 <code>/aiapi/call-b</code>（走 jwt-auth 验签）。
+      关键事实：<strong>经过网关后，业务 A 的 request header 里本来就有 token</strong>——<code>X-Forwarded-Access-Token</code>（access token）+ <code>Authorization</code>（ID token）。
+      所以点上面的 <strong>S1 按钮</strong> 就能自动完成「先经 <code>/api/token</code> 拿 token → 再带 Bearer 直调」两步，无需手动粘贴。</p>
 
       <p style="margin:10px 0 4px;font-weight:600;">① 先用 curl 拿 JWT（password grant，demo-a client）</p>
-      <pre style="margin:0 0 10px;">curl -s -X POST "https://auth.example.com/realms/employees/protocol/openid-connect/token" \\
+      <pre style="margin:0 0 10px;">curl -s -X POST "${kcBase}/realms/employees/protocol/openid-connect/token" \\
   -H "Content-Type: application/x-www-form-urlencoded" \\
   -d "grant_type=password" \\
   -d "client_id=demo-a" \\
-  -d "client_secret=&lt;demo-a 的 client secret&gt;" \\
+  -d "client_secret=${demoASecret}" \\
   -d "username=&lt;你的工号&gt;" \\
   -d "password=&lt;你的密码&gt;" \\
   -d "scope=openid profile email phone" \\
   | node -e "let s='';process.stdin.on('data',d=&gt;s+=d).on('end',()=&gt;console.log(JSON.parse(s).access_token))"</pre>
 
       <p style="margin:10px 0 4px;font-weight:600;">② 再带 Bearer 直调（curl）</p>
-      <pre style="margin:0 0 10px;">curl -s "https://demo-a.example.com/aiapi/call-b" \\
+      <pre style="margin:0 0 10px;">curl -s "https://${demoHost}/aiapi/call-b" \\
   -H "Authorization: Bearer &lt;上一步拿到的 JWT&gt;"</pre>
 
-      <p style="margin:10px 0 4px;font-weight:600;">③ 或在浏览器里用 fetch + Bearer 直调（把 JWT 粘贴到下面）</p>
+      <p style="margin:10px 0 4px;font-weight:600;">③ 或在浏览器里用 fetch + Bearer 直调（点 S1 按钮已自动完成，此输入框供手动验证）</p>
       <input id="jwtInput" type="text" placeholder="粘贴 JWT（eyJhbGci... 开头）" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;margin-bottom:10px;">
       <button id="s1FetchBtn" onclick="callS1WithBearer()">用 Bearer 直调 /aiapi/call-b</button>
       <p class="muted" style="margin:8px 0 0;">实现：<code>fetch('/aiapi/call-b', { headers: { 'Authorization': 'Bearer ' + jwt } })</code> —— 服务端拿到原始 JWT 后透传下一跳，由网关重新验签注入身份。</p>
@@ -352,7 +362,7 @@ function renderPage(identity, jwtPresent) {
 
     <pre id="result" style="display:none"></pre>
     <pre id="headersOut" style="display:none"></pre>
-    <p class="muted" style="margin-top:16px">📖 <a href="https://portal.example.com/auth.html#transit" target="_blank" rel="noopener">开发指导：身份透传（第二跳）完整文档</a> —— S1/S2 的架构图、网关配置、代码逐行拆解与踩坑记录。</p>
+    <p class="muted" style="margin-top:16px">📖 <a href="${portalBase}/auth.html#transit" target="_blank" rel="noopener">开发指导：身份透传（第二跳）完整文档</a> —— S1/S2 的架构图、网关配置、代码逐行拆解与踩坑记录。</p>
   </div>
 
   <script>
@@ -362,11 +372,34 @@ function renderPage(identity, jwtPresent) {
     out.textContent = txt;
   }
   async function callS1() {
+    const btn = document.getElementById('s1Btn');
     const out = document.getElementById('result');
-    out.style.display = 'none';
-    // 展开 S1 说明面板：展示正确的 curl 调用方式 + 提供「粘贴 JWT 用 fetch + Bearer 直调」的入口
-    const panel = document.getElementById('s1Panel');
-    panel.style.display = 'block';
+    btn.disabled = true;
+    out.style.display = 'block';
+    out.textContent = '① 正在经 /api/token 获取 access token…';
+    try {
+      // 第一步：经 /api/token（走 oidc 会话，非 /aiapi）拿到 access token
+      // —— 这是「经过网关后，A 从 request header 里拿到的 token」的直接体现
+      const t = await fetch('/api/token');
+      const tj = await t.json();
+      if (!tj.access_token) {
+        out.textContent = 'HTTP ' + t.status + '\\n\\n' + JSON.stringify(tj, null, 2);
+        btn.disabled = false;
+        return;
+      }
+      out.textContent = '① 已从 /api/token 拿到 access token（长度 ' + tj.access_token.length + '）\\n② 正在带 Bearer 直调 /aiapi/call-b…';
+      // 第二步：带 Bearer 直调 /aiapi/call-b（走 jwt-auth 验签）
+      const r = await fetch('/aiapi/call-b', {
+        headers: { 'Authorization': 'Bearer ' + tj.access_token },
+      });
+      const txt = await r.text();
+      out.textContent = '① 经 /api/token 拿到的 access token（脱敏）:\\n    Bearer ' + tj.access_token.slice(0, 20) + '...' + tj.access_token.slice(-6) +
+        '\\n\\n② 带 Bearer 直调 /aiapi/call-b 的结果（HTTP ' + r.status + '）:\\n\\n' + txt;
+    } catch (e) {
+      out.textContent = '请求失败：' + e;
+    } finally {
+      btn.disabled = false;
+    }
   }
   async function callS1WithBearer() {
     const btn = document.getElementById('s1FetchBtn');
@@ -453,7 +486,7 @@ const server = http.createServer((req, res) => {
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/', identity, hasJwt: !!jwt }))
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(renderPage(identity, !!jwt))
+    res.end(renderPage(identity, !!jwt, req))
     return
   }
 
@@ -575,6 +608,34 @@ const server = http.createServer((req, res) => {
         res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify({ service: 'echo-a', error: '聚合 B/C header 失败', detail: String(err && err.message || err) }))
       })
+    return
+  }
+
+  // S1 点击即测·第一步：/api/token 走 oidc 会话（/api 不在 jwt-auth 的 match_list 里，由 oidc 兜住），
+  // 后端从自己 header 里取出 access token（oidc 插件 pass_access_token 放 X-Forwarded-Access-Token）返回给前端。
+  // 前端拿到 token 后，再带 Bearer 调 /aiapi/call-b（jwt-auth 验签）——完整演示「先拿 token → 再带 Bearer 直调」。
+  if (url.pathname === '/api/token') {
+    const identity = collectIdentity(req)
+    const jwt = extractJwt(req)
+    console.log('[echo-a]', JSON.stringify({ path: '/api/token', identity, hasJwt: !!jwt }))
+    if (!jwt) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        service: 'echo-a', endpoint: '/api/token',
+        error: '未取到 access token（X-Forwarded-Access-Token 缺失）',
+        hint: '请先登录（/ 会自动 302 到 Keycloak），再点按钮。',
+      }, null, 2))
+      return
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({
+      service: 'echo-a',
+      endpoint: '/api/token',
+      note: '这是经过网关后，A 从 request header（X-Forwarded-Access-Token）里拿到的 access token。拿到它后，就能带 Bearer 直调 /aiapi/call-b（jwt-auth 验签路径）。',
+      // 供前端 S1 按钮「先拿 token 再带 Bearer 直调」使用（token 是当前登录用户自己的，同源返回无越权）
+      access_token: jwt,
+      identity,
+    }, null, 2))
     return
   }
 
