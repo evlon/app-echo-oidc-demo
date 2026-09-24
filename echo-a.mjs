@@ -285,6 +285,32 @@ function renderPage(identity, jwtPresent) {
     <button id="s1Btn" onclick="callS1()">S1 · API 直调（带 Bearer）</button>
     <button id="s2Btn" onclick="callS2()">S2 · 浏览器按钮（oidc 会话）</button>
     <a class="logout" href="/oauth2/sign_out">退出登录</a>
+
+    <div id="s1Panel" style="display:none;margin-top:16px;border:1px solid #d0d7de;border-radius:6px;padding:14px 16px;">
+      <h3 style="font-size:14px;margin:0 0 10px;color:#1f2328;">S1 · 正确的调用方式（curl / fetch + Bearer）</h3>
+      <p class="muted" style="margin:0 0 8px;">S1 是「系统/程序间直调」：调用方先拿到 JWT，再自带 <code>Authorization: Bearer &lt;JWT&gt;</code> 直调。浏览器里点按钮之所以 401，是因为浏览器拿不到明文 JWT。</p>
+
+      <p style="margin:10px 0 4px;font-weight:600;">① 先用 curl 拿 JWT（password grant，demo-a client）</p>
+      <pre style="margin:0 0 10px;">curl -s -X POST "https://auth.example.com/realms/employees/protocol/openid-connect/token" \\
+  -H "Content-Type: application/x-www-form-urlencoded" \\
+  -d "grant_type=password" \\
+  -d "client_id=demo-a" \\
+  -d "client_secret=&lt;demo-a 的 client secret&gt;" \\
+  -d "username=&lt;你的工号&gt;" \\
+  -d "password=&lt;你的密码&gt;" \\
+  -d "scope=openid profile email phone" \\
+  | node -e "let s='';process.stdin.on('data',d=&gt;s+=d).on('end',()=&gt;console.log(JSON.parse(s).access_token))"</pre>
+
+      <p style="margin:10px 0 4px;font-weight:600;">② 再带 Bearer 直调（curl）</p>
+      <pre style="margin:0 0 10px;">curl -s "https://demo-a.example.com/api/call-b" \\
+  -H "Authorization: Bearer &lt;上一步拿到的 JWT&gt;"</pre>
+
+      <p style="margin:10px 0 4px;font-weight:600;">③ 或在浏览器里用 fetch + Bearer 直调（把 JWT 粘贴到下面）</p>
+      <input id="jwtInput" type="text" placeholder="粘贴 JWT（eyJhbGci... 开头）" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;margin-bottom:10px;">
+      <button id="s1FetchBtn" onclick="callS1WithBearer()">用 Bearer 直调 /api/call-b</button>
+      <p class="muted" style="margin:8px 0 0;">实现：<code>fetch('/api/call-b', { headers: { 'Authorization': 'Bearer ' + jwt } })</code> —— 服务端拿到原始 JWT 后透传下一跳，由网关重新验签注入身份。</p>
+    </div>
+
     <pre id="result" style="display:none"></pre>
     <p class="muted" style="margin-top:16px">📖 <a href="https://portal.example.com/auth.html#transit" target="_blank" rel="noopener">开发指导：身份透传（第二跳）完整文档</a> —— S1/S2 的架构图、网关配置、代码逐行拆解与踩坑记录。</p>
   </div>
@@ -296,18 +322,31 @@ function renderPage(identity, jwtPresent) {
     out.textContent = txt;
   }
   async function callS1() {
-    const btn = document.getElementById('s1Btn');
     const out = document.getElementById('result');
+    out.style.display = 'none';
+    // 展开 S1 说明面板：展示正确的 curl 调用方式 + 提供「粘贴 JWT 用 fetch + Bearer 直调」的入口
+    const panel = document.getElementById('s1Panel');
+    panel.style.display = 'block';
+  }
+  async function callS1WithBearer() {
+    const btn = document.getElementById('s1FetchBtn');
+    const out = document.getElementById('result');
+    const jwt = document.getElementById('jwtInput').value.trim();
     btn.disabled = true;
     out.style.display = 'block';
     out.textContent = '调用中…';
+    if (!jwt) {
+      setResult(btn, out, '请先在输入框粘贴 JWT。\\n\\n' +
+        'JWT 获取方式见上方「① 先用 curl 拿 JWT」——用 demo-a client 做 password grant 签发 employees token。');
+      return;
+    }
     try {
-      // S1：浏览器里点这个按钮，因为没有 Bearer token，/api/* 走 jwt-auth 会被 401
-      const r = await fetch('/api/call-b');
+      // S1 正确用法：fetch 附加 Authorization: Bearer 头直调 /api/call-b
+      const r = await fetch('/api/call-b', {
+        headers: { 'Authorization': 'Bearer ' + jwt },
+      });
       const txt = await r.text();
-      setResult(btn, out, 'HTTP ' + r.status + '\\n\\n' + txt +
-        '\\n\\n[说明] 浏览器里点 S1 会 401「Jwt is missing」——这是预期的：/api/* 走 jwt-auth，' +
-        '而浏览器拿不到明文 JWT（token 在 oidc 服务端 cookie）。S1 的正确用法是程序/curl 自带 Authorization: Bearer 头直调。');
+      setResult(btn, out, 'HTTP ' + r.status + '\\n\\n' + txt);
     } catch (e) {
       setResult(btn, out, '请求失败：' + e);
     }
