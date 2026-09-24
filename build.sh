@@ -28,6 +28,7 @@ cp    "$DEMO_DIR/echo-server.mjs" "$STAGE/"
 cp    "$DEMO_DIR/echo-a.mjs"      "$STAGE/"
 cp    "$DEMO_DIR/echo-b.mjs"      "$STAGE/"
 cp    "$DEMO_DIR/echo-c.mjs"      "$STAGE/"
+cp    "$DEMO_DIR/userinfo.js"     "$STAGE/"
 cp    "$DEMO_DIR/package.json"    "$STAGE/"
 cp    "$DEMO_DIR/Dockerfile"      "$STAGE/"
 

@@ -43,7 +43,7 @@ spec:
             - "demo-b.example.com"
       containers:
         - name: demo-a
-          image: registry.example.com/library/echo-oidc-demo:20260924-aiapi3hop
+          image: dockerhub.kubekey.local:31104/library/echo-oidc-demo:20260924-uibtn
           imagePullPolicy: IfNotPresent
           # 启动 echo-a.mjs（多服务共用一个镜像，用 command 选择）
           command: ["node", "echo-a.mjs"]

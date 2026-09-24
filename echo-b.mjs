@@ -31,20 +31,9 @@
  * 运行：node echo-b.mjs（PORT 默认 8080；ECHO_C_URL 指向 demo-c 的网关域名）
  * ═══════════════════════════════════════════════════════════════════════ */
 import http from 'node:http'
+import { fetchUserInfo, extractAccessToken, claimsToIdentity } from './userinfo.js'
 
 const PORT = Number(process.env.PORT || 8080)
-
-/* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】中文 header 乱码修复（与 echo-server 同源）
- * ═══════════════════════════════════════════════════════════════════════ */
-function unMojibake(v) {
-  if (v == null) return null
-  try {
-    return Buffer.from(String(v), 'latin1').toString('utf8')
-  } catch {
-    return v
-  }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 【对接代码】(a) 读取「原始 JWT」（供透传到下一跳 demo-c）
@@ -80,18 +69,29 @@ async function callEchoC(jwt) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】读网关注入的身份头（本跳自己的身份）
+ * 【对接代码】读网关注入的身份头（ASCII）+ 调 UserInfo 拿中文姓名
+ * ═══════════════════════════════════════════════════════════════════════
+ * 公司统一约定的「身份透传规范」（详见 userinfo.js）：
+ *   ASCII 字段读 X-User-* 头（零查询），中文姓名调 UserInfo 拿干净 UTF-8。
  * ═══════════════════════════════════════════════════════════════════════ */
-function collectIdentity(req) {
-  return {
+async function collectIdentity(req) {
+  const fromHeaders = {
     username: req.headers['x-user-username'] ?? null,
-    name: unMojibake(req.headers['x-user-name']),
     email: req.headers['x-user-email'] ?? null,
     phone: req.headers['x-user-phone'] ?? null,
     employeeNo: req.headers['x-user-employee-no'] ?? null,
-    givenName: unMojibake(req.headers['x-user-given-name']),
-    familyName: unMojibake(req.headers['x-user-family-name']),
     sub: req.headers['x-user-sub'] ?? null,
+  }
+  const info = claimsToIdentity(await fetchUserInfo(extractAccessToken(req)))
+  return {
+    username: fromHeaders.username ?? info.username ?? null,
+    name: info.name ?? null,
+    email: fromHeaders.email ?? info.email ?? null,
+    phone: fromHeaders.phone ?? info.phone ?? null,
+    employeeNo: fromHeaders.employeeNo ?? info.employeeNo ?? null,
+    givenName: info.givenName ?? null,
+    familyName: info.familyName ?? null,
+    sub: fromHeaders.sub ?? info.sub ?? null,
   }
 }
 
@@ -144,7 +144,7 @@ function renderChain(identity, jwtPresent, cResult) {
 /* ═══════════════════════════════════════════════════════════════════════
  * 【业务代码】HTTP 服务器主干
  * ═══════════════════════════════════════════════════════════════════════ */
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
 
   if (url.pathname === '/health') {
@@ -155,7 +155,7 @@ const server = http.createServer((req, res) => {
 
   // 中间跳身份回显 + 链式透传调 C（/aiapi/me 与 / 同义）
   if (url.pathname === '/' || url.pathname === '/aiapi/me') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-b]', JSON.stringify({ path: url.pathname, identity, hasJwt: !!jwt }))
 
@@ -188,7 +188,7 @@ const server = http.createServer((req, res) => {
 
   // 显式「透传调 C」端点（页面点击即测用）
   if (url.pathname === '/aiapi/call-c') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-b]', JSON.stringify({ path: url.pathname, identity, hasJwt: !!jwt }))
 
@@ -211,18 +211,56 @@ const server = http.createServer((req, res) => {
   }
 
   // 完整回显实际收到的请求头（页面「点击即测」展示 B 这一跳收到的头）
+  // 若带 ?with-c=1，则 B 内部再透传 JWT 调 C 的 /aiapi/echo-headers，把 C 收到的头
+  // 一并带回 —— 体现「A → B → C」真链路（C 的头是 B 调出来的，不是 A 直连 C）。
   if (url.pathname === '/aiapi/echo-headers') {
-    const identity = collectIdentity(req)
-    console.log('[echo-b]', JSON.stringify({ path: url.pathname, identity }))
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({
-      service: 'echo-b',
-      hop: 2,
-      endpoint: '/aiapi/echo-headers',
-      identity,
-      headers: collectHeaders(req),
-      note: 'Authorization / X-Forwarded-Access-Token 已脱敏（仅前缀）；X-User-* 由网关 jwt-auth-demo-b 注入',
-    }, null, 2))
+    const identity = await collectIdentity(req)
+    const jwt = extractJwt(req)
+    console.log('[echo-b]', JSON.stringify({ path: url.pathname, identity, hasJwt: !!jwt, withC: url.searchParams.get('with-c') === '1' }))
+
+    // 不带 with-c=1：只回显 B 自己的头（向后兼容旧行为）
+    if (url.searchParams.get('with-c') !== '1') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        service: 'echo-b',
+        hop: 2,
+        endpoint: '/aiapi/echo-headers',
+        identity,
+        headers: collectHeaders(req),
+        note: 'Authorization / X-Forwarded-Access-Token 已脱敏（仅前缀）；X-User-* 由网关 jwt-auth-demo-b 注入',
+      }, null, 2))
+      return
+    }
+
+    // 带 with-c=1：B 内部透传 JWT 调 C 的 echo-headers，把 C 的头一并带回
+    if (!jwt) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ service: 'echo-b', hop: 2, mode: 'B-echo-headers-with-c', error: 'Jwt is missing' }))
+      return
+    }
+    const cHeadersUrl = (process.env.ECHO_C_URL || 'https://demo-c.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers')
+    try {
+      const cr = await fetch(cHeadersUrl, { headers: { Authorization: 'Bearer ' + jwt } })
+      const ctxt = await cr.text()
+      let cj; try { cj = JSON.parse(ctxt) } catch { cj = ctxt }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        service: 'echo-b',
+        hop: 2,
+        endpoint: '/aiapi/echo-headers',
+        identity,
+        headers: collectHeaders(req),
+        note: 'Authorization / X-Forwarded-Access-Token 已脱敏（仅前缀）；X-User-* 由网关 jwt-auth-demo-b 注入',
+        downstreamEchoC: {
+          url: cHeadersUrl,
+          status: cr.status,
+          data: cj,
+        },
+      }, null, 2))
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ service: 'echo-b', error: '调用 echo-c 失败', detail: String(e && e.message || e) }))
+    }
     return
   }
 

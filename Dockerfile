@@ -34,6 +34,7 @@ COPY echo-server.mjs    /app/echo-server.mjs
 COPY echo-a.mjs         /app/echo-a.mjs
 COPY echo-b.mjs         /app/echo-b.mjs
 COPY echo-c.mjs         /app/echo-c.mjs
+COPY userinfo.js        /app/userinfo.js
 COPY package.json       /app/package.json
 
 EXPOSE 8080

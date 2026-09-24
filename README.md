@@ -34,12 +34,12 @@
 | `http.createServer` / 路由 / `/health` | **业务** | 任何 Web 应用都有 |
 | `renderJson` | **业务** | 返回 JSON |
 | `renderPage` | **业务** | 渲染 HTML 页面 |
-| `collectIdentity`（读 `X-User-*` 头） | **对接** | 读网关注入的身份 |
-| `unMojibake` | **对接** | 修中文 header 乱码坑 |
+| `collectIdentity`（读 `X-User-*` 头 + 调 UserInfo） | **对接** | 读 ASCII 身份头 + 中文走 UserInfo |
+| `userinfo.js`（`fetchUserInfo` / `extractAccessToken`） | **对接** | 调 Keycloak UserInfo 拿全量身份的标准模块 |
 | 退出登录链接 | **对接** | 真正登出 Keycloak SSO |
 | `Cache-Control: no-store` | **对接** | 防缓存导致「假登录」 |
 
-> 一句话：**业务代码 = 你的服务本来要写的；对接代码 = 为了接认证/网关额外加的 4 小块。**
+> 一句话：**业务代码 = 你的服务本来要写的；对接代码 = 为了接认证/网关额外加的几小块。**
 
 ---
 
@@ -96,7 +96,12 @@ higress-cli create --name echo --domains echo.ai.example.com \
   `02-开发-接入指南.md`）；后端 API 无状态，不涉及登出。
 - **Q：我后端要校验 token 吗？** 在网关后面不用（网关已验）。若你的服务要**绕过网关**
   或**被外部直接访问**，才需要在应用内用 JWKS 自验（`02` 有示例说明）。
-- **Q：中文姓名乱码？** 用 `unMojibake`（见源码注释）。
+- **Q：中文姓名乱码？** 不再用 `unMojibake`。ASCII 字段读 `X-User-*` 头，中文姓名
+  用 access token 调 UserInfo 拿干净 UTF-8（见 `userinfo.js` 与
+  `docs/认证接入/07-身份透传-第二跳.md` 第九章）。
+- **Q：手机号（phone_number）能拿到吗？** 能。`phone` 是 realm 默认 scope，`phone_number`
+  claim 已配好、数据已落本地表，网关也已注入 `X-User-Phone` 头；UserInfo 里也有
+  `phone_number`（实测 `niukunliang` 手机号数据在位）。
 
 ---
 
@@ -150,6 +155,7 @@ app-echo-oidc-demo/
 ├── echo-a.mjs             # 身份透传第一跳（透传 JWT 调下游）
 ├── echo-b.mjs             # 身份透传第二跳（中间跳，透传 JWT 调 echo-c）
 ├── echo-c.mjs             # 身份透传第三跳（链式末端，读网关注入身份）
+├── userinfo.js            # ⭐ 身份获取标准模块（ASCII 读头 + 中文调 UserInfo）
 ├── verify-transit.mjs     # 两跳端到端验证脚本（本机运行）
 ├── verify-3hop.mjs        # 三跳端到端验证脚本（本机运行）
 ├── package.json

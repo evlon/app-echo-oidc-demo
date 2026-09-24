@@ -20,11 +20,18 @@
  * ── 代码如何划分（这是关键）──────────────────────────────────────────────
  *   【业务代码】  ：任何 Web 应用都有的——HTTP 服务器、路由、渲染、健康检查。
  *   【对接代码】  ：为了接「公司统一认证 / 网关」额外加的——
- *                  (a) 读取 X-User-* 身份头（网关注入的认证结果）
- *                  (b) unMojibake（处理中文 header 乱码，对接细节）
+ *                  (a) 读取 X-User-* 身份头（ASCII 字段：username/email/phone 等）
+ *                  (b) 调 UserInfo 拿中文姓名（非 ASCII 字段，干净 UTF-8 不乱码）
  *                  (c) 退出登录链接（真正登出 Keycloak SSO）
  *                  (d) Cache-Control: no-store（保证每次经网关拦截）
  *   每个函数顶部都标注了它是【业务】还是【对接】。
+ *
+ * ── 身份获取规范（重要，公司统一约定）───────────────────────────────────────
+ *   身份信息分两类，走两条通道（见 userinfo.js 顶部注释）：
+ *     · ASCII 字段（username/email/phone_number/sub/员工编号）→ 读 X-User-* 头，
+ *       零查询、零乱码；
+ *     · 中文姓名（name/given_name/family_name）→ 用 access token 调 UserInfo，
+ *       拿干净 UTF-8（不再用 unMojibake 反解码 header）。
  *
  * 运行：node echo-server.mjs（PORT 默认 8080）
  * 镜像：见 Dockerfile + build.sh（如何打进镜像上内网网关）
@@ -32,102 +39,75 @@
  * ============================================================================
  */
 import http from 'node:http'
+import { fetchUserInfo, extractAccessToken, claimsToIdentity } from './userinfo.js'
 
 const PORT = Number(process.env.PORT || 8080)
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】(a) 读取网关注入的认证身份头
+ * 【对接代码】(a) 读取网关注入的认证身份头（仅 ASCII 字段）
  * ───────────────────────────────────────────────────────────────────────
- * 网关（oidc / jwt-auth 插件）校验通过后，会把 JWT 里的身份字段以
+ * 网关（oidc / jwt-auth 插件）校验通过后，会把 JWT 里的 ASCII 身份字段以
  * X-User-* 请求头注入并转发给后端。业务后端「不再自己管登录」，
  * 只需要从这里读取「当前是谁」即可。
  *
  * 具体注入哪些头，由网关 wasmplugin 的 claims_to_headers 配置决定
- * （见 docs/认证接入/01-运维-配置手册.md）。
+ * （见 docs/认证接入/01-运维-配置手册.md）。当前已注入：
+ *   preferred_username→X-User-Username、email→X-User-Email、
+ *   phone_number→X-User-Phone、new_emp_no→X-User-Employee-No、
+ *   given_name/family_name→X-User-Given-Name/Family-Name、sub→X-User-Sub。
  *
- * 补充：浏览器 OIDC 链路里，网关为何有「两种身份来源」？
- *   – API/Bearer 链路（jwt-auth）：网关把 claim 注入 X-User-* 头 → 读头。
- *   – 浏览器 OIDC 链路（oidc）：网关默认不注入 X-User-* 头，而是把
- *     Access Token 放 X-Forwarded-Access-Token、ID Token 放 Authorization。
- *     → 这里当 X-User-* 缺员时，从 token 里解析 claim（含 new_emp_no）。
+ * ⚠️ 注意：这里【只读 ASCII 字段】。中文姓名（name/given_name/family_name）
+ * 走 header 会 latin-1 乱码，统一改由 UserInfo 拿（见下方 collectIdentity）。
+ *
  * 员工编号：Keycloak claim 名 new_emp_no（由 LDAP 属性 NewEmpNo 映射，
  * LDAP 属性名不可改）。
  * ═══════════════════════════════════════════════════════════════════════ */
-function decodeJwtPayload(v) {
-  if (!v) return null
-  const parts = String(v).split('.')
-  if (parts.length !== 3) return null
-  try {
-    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
-    while (b64.length % 4) b64 += '='
-    return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'))
-  } catch {
-    return null
-  }
-}
-
-function claimsToIdentity(p) {
-  return p ? {
-    username: p.preferred_username ?? null,
-    name: p.name ?? null,
-    email: p.email ?? null,
-    phone: p.phone_number ?? null,
-    employeeNo: p.new_emp_no ?? null,
-    givenName: p.given_name ?? null,
-    familyName: p.family_name ?? null,
-  } : {}
-}
-
-function collectIdentity(req) {
-  const fromHeaders = {
+function collectAsciiFromHeaders(req) {
+  return {
     username: req.headers['x-user-username'] ?? null,
-    name: unMojibake(req.headers['x-user-name']),
     email: req.headers['x-user-email'] ?? null,
     phone: req.headers['x-user-phone'] ?? null,
     employeeNo: req.headers['x-user-employee-no'] ?? null,
-    givenName: unMojibake(req.headers['x-user-given-name']),
-    familyName: unMojibake(req.headers['x-user-family-name']),
-  }
-
-  // token 兜底：浏览器 OIDC 链路网关不注入 X-User-*，身份从 token 解析
-  const authHdr = req.headers['authorization'] || ''
-  const token = authHdr.startsWith('Bearer ')
-    ? authHdr.slice(7).trim()
-    : null
-  const fromClaims = claimsToIdentity(
-    decodeJwtPayload(token) ||
-    decodeJwtPayload(req.headers['x-forwarded-access-token'])
-  )
-
-  return {
-    username: fromHeaders.username ?? fromClaims.username ?? null,
-    name: fromHeaders.name ?? fromClaims.name ?? null,
-    email: fromHeaders.email ?? fromClaims.email ?? null,
-    phone: fromHeaders.phone ?? fromClaims.phone ?? null,
-    employeeNo: fromHeaders.employeeNo ?? fromClaims.employeeNo ?? null,
-    givenName: fromHeaders.givenName ?? fromClaims.givenName ?? null,
-    familyName: fromHeaders.familyName ?? fromClaims.familyName ?? null,
+    sub: req.headers['x-user-sub'] ?? null,
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】(b) 中文 header 乱码修复（unMojibake）
+ * 【对接代码】(b) 汇总身份：ASCII 读头 + 中文走 UserInfo
  * ───────────────────────────────────────────────────────────────────────
- * Higress 的 claims_to_headers 把 JWT 的 UTF-8 中文字段原样写进 header，
- * 而 Node 的 req.headers 按 latin-1 解码 header 值 → 中文变成乱码
- * （如 「刘彦龙」→「çæäº®」）。
+ * 这是本示例的核心范式（公司统一约定的「身份透传规范」）：
  *
- * 这里把 latin-1 再编码回字节、按 utf-8 解码，恢复原始中文字符。
- * （ASCII 值往返不变，安全；仅当 Header 里带了中文姓名时才需要。）
- * 这是对接层的一个「实测坑」，不是业务逻辑。
+ *   1. ASCII 字段（username/email/phone/员工编号/sub）→ 直接读网关注入的头，
+ *      零查询、零乱码；
+ *   2. 中文姓名（name/given_name/family_name）→ 用 access token 调 UserInfo
+ *      拿【干净 UTF-8】，不再写 unMojibake 反解码。
+ *
+ * 兜底逻辑：
+ *   · 若网关注入的头缺失（如浏览器 OIDC 链路不注入 X-User-*），则 ASCII 字段
+ *     也一并从 UserInfo 结果里补齐；
+ *   · 若 UserInfo 调失败（token 无效 / 网络故障），中文姓名降级为 null，
+ *     ASCII 字段仍从头里拿到（不影响主流程）。
+ *
+ * 因为要调 UserInfo，本函数是 async（业务端 await 一下即可）。
  * ═══════════════════════════════════════════════════════════════════════ */
-function unMojibake(v) {
-  if (v == null) return null
-  try {
-    const recovered = Buffer.from(String(v), 'latin1').toString('utf8')
-    return recovered
-  } catch {
-    return v
+async function collectIdentity(req) {
+  // ① ASCII 字段：直接读头（快，零查询）
+  const fromHeaders = collectAsciiFromHeaders(req)
+
+  // ② 中文 + 兜底：用 access token 调 UserInfo 拿全量（含干净中文 name）
+  const token = extractAccessToken(req)
+  const info = claimsToIdentity(await fetchUserInfo(token))
+
+  // ③ 合并：ASCII 优先读头（更省），中文优先 UserInfo（干净）；头缺失时用 UserInfo 兜底
+  return {
+    username: fromHeaders.username ?? info.username ?? null,
+    name: info.name ?? null, // 中文姓名只信任 UserInfo 的干净 UTF-8，不读乱码头
+    email: fromHeaders.email ?? info.email ?? null,
+    phone: fromHeaders.phone ?? info.phone ?? null,
+    employeeNo: fromHeaders.employeeNo ?? info.employeeNo ?? null,
+    givenName: info.givenName ?? null,
+    familyName: info.familyName ?? null,
+    sub: fromHeaders.sub ?? info.sub ?? null,
   }
 }
 
@@ -256,8 +236,8 @@ const server = http.createServer((req, res) => {
 
   let body = ''
   req.on('data', (c) => { body += c })
-  req.on('end', () => {
-    const identity = collectIdentity(req)
+  req.on('end', async () => {
+    const identity = await collectIdentity(req)
     const consumer = req.headers['x-mse-consumer'] ?? null
     console.log('[echo]', JSON.stringify({ path: url.pathname, identity, consumer }))
 

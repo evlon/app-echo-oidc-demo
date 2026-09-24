@@ -72,6 +72,7 @@
  * ============================================================================
  */
 import http from 'node:http'
+import { fetchUserInfo, extractAccessToken, claimsToIdentity } from './userinfo.js'
 
 const PORT = Number(process.env.PORT || 8080)
 
@@ -134,58 +135,28 @@ async function callEchoB(jwt) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】读网关注入的身份头（本跳自己的身份，用于展示第一跳结果）
- * 与 echo-server.mjs 的 collectIdentity 同源 —— 中文乱码用 unMojibake 修。
+ * 【对接代码】读网关注入的身份头（ASCII）+ 调 UserInfo 拿中文姓名
+ * 与 echo-server.mjs 的 collectIdentity 同源 —— 公司统一「身份透传规范」：
+ *   ASCII 字段读 X-User-* 头（零查询），中文姓名调 UserInfo 拿干净 UTF-8。
  * ═══════════════════════════════════════════════════════════════════════ */
-function unMojibake(v) {
-  if (v == null) return null
-  try {
-    return Buffer.from(String(v), 'latin1').toString('utf8')
-  } catch {
-    return v
-  }
-}
-
-/* 【对接代码】从 JWT payload 段解析 claims（仅 base64 解码，不验签——信任已过
- * 网关认证的 token）。oidc 路径下网关注入的是 ID Token（Authorization）/ Access
- * Token（X-Forwarded-Access-Token），不一定有 X-User-* 头，所以这里兜底解 claims。 */
-function decodeJwtPayload(v) {
-  if (!v) return null
-  const parts = String(v).split('.')
-  if (parts.length !== 3) return null
-  try {
-    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
-    while (b64.length % 4) b64 += '='
-    return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'))
-  } catch {
-    return null
-  }
-}
-
-function collectIdentity(req) {
-  // X-User-* 头由 jwt-auth claims_to_headers 注入（API/Bearer 路径）
+async function collectIdentity(req) {
   const fromHeaders = {
     username: req.headers['x-user-username'] ?? null,
-    name: unMojibake(req.headers['x-user-name']),
     email: req.headers['x-user-email'] ?? null,
     phone: req.headers['x-user-phone'] ?? null,
     employeeNo: req.headers['x-user-employee-no'] ?? null,
     sub: req.headers['x-user-sub'] ?? null,
   }
-
-  // oidc（浏览器）路径：优先从 token 兜底解 claims（X-User-* 头不一定在）
-  const accessTok = req.headers['x-forwarded-access-token'] || null
-  const authHdr = req.headers['authorization'] || ''
-  const idTok = authHdr.startsWith('Bearer ') ? authHdr.slice(7).trim() : null
-  const payload = decodeJwtPayload(accessTok) || decodeJwtPayload(idTok)
-
+  const info = claimsToIdentity(await fetchUserInfo(extractAccessToken(req)))
   return {
-    username: fromHeaders.username ?? payload?.preferred_username ?? null,
-    name: fromHeaders.name ?? payload?.name ?? null,
-    email: fromHeaders.email ?? payload?.email ?? null,
-    phone: fromHeaders.phone ?? payload?.phone_number ?? null,
-    employeeNo: fromHeaders.employeeNo ?? payload?.new_emp_no ?? null,
-    sub: fromHeaders.sub ?? payload?.sub ?? null,
+    username: fromHeaders.username ?? info.username ?? null,
+    name: info.name ?? null,
+    email: fromHeaders.email ?? info.email ?? null,
+    phone: fromHeaders.phone ?? info.phone ?? null,
+    employeeNo: fromHeaders.employeeNo ?? info.employeeNo ?? null,
+    givenName: info.givenName ?? null,
+    familyName: info.familyName ?? null,
+    sub: fromHeaders.sub ?? info.sub ?? null,
   }
 }
 
@@ -260,9 +231,8 @@ function renderPage(identity, jwtPresent, req) {
   // 而不是写死 example.com 占位符（否则照着跑会解析失败）。
   const demoHost = req?.headers?.host || 'demo-a.example.com'
   const kcBase = process.env.KC_BASE_URL || 'https://auth.example.com'
-  // 门户文档地址（点开直达「身份透传」章节）；demo-a client 的 secret（curl password grant 用）
+  // 门户文档地址（点开直达「身份透传」章节）
   const portalBase = process.env.PORTAL_BASE_URL || 'https://ai.ict.cmcc'
-  const demoASecret = process.env.DEMO_A_CLIENT_SECRET || '<demo-a 的 client secret>'
   const rows = [
     ['用户名 username', identity.username],
     ['姓名 name', identity.name],
@@ -294,16 +264,41 @@ function renderPage(identity, jwtPresent, req) {
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eaeef2; font-size: 14px; }
   th { color: #57606a; font-weight: 500; width: 40%; white-space: nowrap; }
-  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
-           padding: 10px 18px; font-size: 15px; cursor: pointer; margin-right: 8px; }
-  button:disabled { background: #9bb8e6; cursor: not-allowed; }
   table.cmp th { width: 22%; }
   table.cmp td { font-size: 13px; }
   code { background: #f6f8fa; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
         padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
-  .logout { display: inline-block; margin-left: 12px; color: #cf222e; font-size: 14px; }
   .muted { color: #57606a; font-size: 13px; }
+
+  /* ── 操作区：按钮分组布局 ─────────────────────────────── */
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+             margin-top: 18px; padding-top: 16px; border-top: 1px solid #eaeef2; }
+  .actions .group { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .actions .spacer { flex: 1 1 auto; }
+
+  /* 按钮基础样式：统一高度与圆角，去掉 margin 依赖 */
+  button { display: inline-flex; align-items: center; gap: 6px;
+           border: 1px solid transparent; border-radius: 6px;
+           padding: 9px 16px; font-size: 14px; font-weight: 500;
+           cursor: pointer; line-height: 1.4; transition: background .12s, border-color .12s; }
+
+  /* 主按钮：S1 / S2 动作 */
+  button.btn-primary { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+  button.btn-primary:hover { background: #1a5fd0; border-color: #1a5fd0; }
+
+  /* 次级按钮：查看请求头 */
+  button.btn-secondary { background: #fff; color: #1f6feb; border-color: #d0d7de; }
+  button.btn-secondary:hover { background: #f6f8fa; border-color: #1f6feb; }
+
+  button:disabled { background: #eaeef2 !important; color: #9aa0a6 !important;
+                    border-color: #d0d7de !important; cursor: not-allowed; }
+
+  /* 退出登录：弱化文字链接，视觉上独立于动作按钮 */
+  .logout { display: inline-flex; align-items: center; gap: 4px;
+            color: #cf222e; font-size: 14px; text-decoration: none;
+            padding: 8px 4px; white-space: nowrap; }
+  .logout:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -328,10 +323,15 @@ function renderPage(identity, jwtPresent, req) {
       <tr><th>token 来源</th><td>调用方自带 <code>Authorization: Bearer &lt;JWT&gt;</code></td><td>oidc 插件放 <code>X-Forwarded-Access-Token</code>，后端取出</td></tr>
       <tr><th>适合场景</th><td>系统 / 程序间调用</td><td>人在浏览器里点按钮</td></tr>
     </table>
-    <button id="s1Btn" onclick="callS1()">S1 · 点击即测（先拿 token → 带 Bearer 直调）</button>
-    <button id="s2Btn" onclick="callS2()">S2 · 浏览器按钮（oidc 会话）</button>
-    <button id="headersBtn" onclick="callHeaders()">🔍 查看 A/B/C 实际收到的请求头</button>
-    <a class="logout" href="/oauth2/sign_out">退出登录</a>
+    <div class="actions">
+      <div class="group">
+        <button id="s1Btn" class="btn-primary" onclick="callS1()">▶ S1 点击即测（先拿 token → 带 Bearer 直调）</button>
+        <button id="s2Btn" class="btn-primary" onclick="callS2()">▶ S2 浏览器按钮（oidc 会话）</button>
+        <button id="headersBtn" class="btn-secondary" onclick="callHeaders()">🔍 查看 A/B/C 请求头</button>
+      </div>
+      <span class="spacer"></span>
+      <a class="logout" href="/oauth2/sign_out">退出登录</a>
+    </div>
 
     <div id="s1Panel" style="margin-top:16px;border:1px solid #d0d7de;border-radius:6px;padding:14px 16px;">
       <h3 style="font-size:14px;margin:0 0 10px;color:#1f2328;">S1 · 正确的调用方式（先拿 token → 再带 Bearer 直调）</h3>
@@ -339,16 +339,14 @@ function renderPage(identity, jwtPresent, req) {
       关键事实：<strong>经过网关后，业务 A 的 request header 里本来就有 token</strong>——<code>X-Forwarded-Access-Token</code>（access token）+ <code>Authorization</code>（ID token）。
       所以点上面的 <strong>S1 按钮</strong> 就能自动完成「先经 <code>/api/token</code> 拿 token → 再带 Bearer 直调」两步，无需手动粘贴。</p>
 
-      <p style="margin:10px 0 4px;font-weight:600;">① 先用 curl 拿 JWT（password grant，demo-a client）</p>
-      <pre style="margin:0 0 10px;">curl -s -X POST "${kcBase}/realms/employees/protocol/openid-connect/token" \\
-  -H "Content-Type: application/x-www-form-urlencoded" \\
-  -d "grant_type=password" \\
-  -d "client_id=demo-a" \\
-  -d "client_secret=${demoASecret}" \\
-  -d "username=&lt;你的工号&gt;" \\
-  -d "password=&lt;你的密码&gt;" \\
-  -d "scope=openid profile email phone" \\
-  | node -e "let s='';process.stdin.on('data',d=&gt;s+=d).on('end',()=&gt;console.log(JSON.parse(s).access_token))"</pre>
+      <p style="margin:10px 0 4px;font-weight:600;">① 拿到 JWT —— 不用自己输工号密码，token 已经在请求头里</p>
+      <pre style="margin:0 0 10px;"># 后台程序（服务端）：请求经过网关后，header 里本来就有 token，直接读即可，无需自己换取
+#   X-Forwarded-Access-Token  ← oidc 插件 pass_access_token 放入（Access Token，优先取这个）
+#   Authorization: Bearer ...  ← oidc 插件 pass_authorization_header 放入（ID Token，兜底）
+const jwt = req.headers['x-forwarded-access-token'] || (req.headers['authorization'] || '').replace(/^Bearer\\s+/i, '')
+
+# 浏览器（前端）：复用 SSO 会话，走 /api/token 拿 access token（脱敏演示端点，见下方 S1 按钮）
+await fetch('/api/token').then(r =&gt; r.json()).then(t =&gt; t.access_token)</pre>
 
       <p style="margin:10px 0 4px;font-weight:600;">② 再带 Bearer 直调（curl）</p>
       <pre style="margin:0 0 10px;">curl -s "https://${demoHost}/aiapi/call-b" \\
@@ -410,7 +408,7 @@ function renderPage(identity, jwtPresent, req) {
     out.textContent = '调用中…';
     if (!jwt) {
       setResult(btn, out, '请先在输入框粘贴 JWT。\\n\\n' +
-        'JWT 获取方式见上方「① 先用 curl 拿 JWT」——用 demo-a client 做 password grant 签发 employees token。');
+        'JWT 获取方式见上方「① 拿到 JWT」——token 已经在网关注入的请求头里（或经 /api/token 拿），无需用密码换取。');
       return;
     }
     try {
@@ -471,7 +469,7 @@ function escapeHtml(v) {
  * 【业务代码】HTTP 服务器主干
  * 就是一个普通 Node 服务：/health 探针 + 主路由调用下游并回显。
  * ═══════════════════════════════════════════════════════════════════════ */
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
 
   if (url.pathname === '/health') {
@@ -482,7 +480,7 @@ const server = http.createServer((req, res) => {
 
   // 浏览器首页：渲染 HTML 登录页（不自动调 demo-b，等用户点按钮）
   if (url.pathname === '/') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/', identity, hasJwt: !!jwt }))
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -492,7 +490,7 @@ const server = http.createServer((req, res) => {
 
   // S1（API 直调）：/aiapi/call-b 走 jwt-auth（无状态验签），调用方自带 Authorization: Bearer <JWT>
   if (url.pathname === '/aiapi/call-b') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/aiapi/call-b', identity, hasJwt: !!jwt }))
 
@@ -526,7 +524,7 @@ const server = http.createServer((req, res) => {
 
   // S2（浏览器按钮）：/ui/call-b 走 oidc 会话，后端从 X-Forwarded-Access-Token 拿 access token 透传
   if (url.pathname === '/ui/call-b') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/ui/call-b', identity, hasJwt: !!jwt }))
 
@@ -561,7 +559,7 @@ const server = http.createServer((req, res) => {
   // 点击即测：/ui/headers 走 oidc 会话，回显 A/B/C 三跳各自实际收到的请求头
   // （浏览器点「查看 A/B/C 实际收到的请求头」→ fetch 这里，后端用 access token 依次调 B、C 的 echo-headers）
   if (url.pathname === '/ui/headers') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/ui/headers', identity, hasJwt: !!jwt }))
 
@@ -575,8 +573,9 @@ const server = http.createServer((req, res) => {
       return
     }
 
-    const cUrl = (process.env.ECHO_C_URL || 'https://demo-c.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers')
-    const bUrl = (process.env.ECHO_B_URL || 'https://demo-b.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers')
+    // ⭐ 真链路 A → B → C：A 只调 B（带 with-c=1），B 内部透传 JWT 调 C 把 C 的头带回。
+    // 不再由 A 直连 C（直连会让 A 需要映射 demo-c 的 hostAliases，且不符合「第二跳」语义）。
+    const bHeadersUrl = (process.env.ECHO_B_URL || 'https://demo-b.example.com/aiapi/me').replace(/\/aiapi\/me$/, '/aiapi/echo-headers') + '?with-c=1'
 
     async function fetchHeaders(url) {
       try {
@@ -589,18 +588,27 @@ const server = http.createServer((req, res) => {
       }
     }
 
-    Promise.all([fetchHeaders(bUrl), fetchHeaders(cUrl)])
-      .then(([bRes, cRes]) => {
+    fetchHeaders(bHeadersUrl)
+      .then((bRes) => {
+        // hop2 = B 自己收到的头；hop3 = B 转发的 C 收到的头（嵌套在 bRes.data.downstreamEchoC 里）
+        const cRes = (bRes.data && bRes.data.downstreamEchoC)
+          ? { url: bRes.data.downstreamEchoC.url, status: bRes.data.downstreamEchoC.status, data: bRes.data.downstreamEchoC.data }
+          : { url: '(经 B 转发的 C)', status: 'N/A', error: 'B 未返回 C 的请求头（downstreamEchoC 缺失）' }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify({
           endpoint: '/ui/headers',
-          note: 'A/B/C 三跳各自实际收到的请求头（Authorization / X-Forwarded-Access-Token 已脱敏）',
+          note: 'A/B/C 三跳各自实际收到的请求头（Authorization / X-Forwarded-Access-Token 已脱敏）；hop3 是经 B 透传调 C 所得（真链路 A→B→C）',
           hop1_echoA: {
             url: 'https://demo-a.example.com（本服务）',
             identity,
             headers: collectHeaders(req),
           },
-          hop2_echoB: bRes,
+          hop2_echoB: {
+            url: bRes.url,
+            status: bRes.status,
+            identity: bRes.data && bRes.data.identity,
+            headers: bRes.data && bRes.data.headers,
+          },
           hop3_echoC: cRes,
         }, null, 2))
       })
@@ -615,7 +623,7 @@ const server = http.createServer((req, res) => {
   // 后端从自己 header 里取出 access token（oidc 插件 pass_access_token 放 X-Forwarded-Access-Token）返回给前端。
   // 前端拿到 token 后，再带 Bearer 调 /aiapi/call-b（jwt-auth 验签）——完整演示「先拿 token → 再带 Bearer 直调」。
   if (url.pathname === '/api/token') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     const jwt = extractJwt(req)
     console.log('[echo-a]', JSON.stringify({ path: '/api/token', identity, hasJwt: !!jwt }))
     if (!jwt) {
@@ -641,7 +649,7 @@ const server = http.createServer((req, res) => {
 
   // API: whoami —— 回显第一跳身份（docs/10 §4.1 契约；s1s2 版补齐，suhuhu 等真实账号可见工号）
   if (url.pathname === '/aiapi/whoami') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     console.log('[echo-a]', JSON.stringify({ path: '/aiapi/whoami', identity }))
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({
@@ -662,7 +670,7 @@ const server = http.createServer((req, res) => {
 
   // 完整回显实际收到的请求头（页面「点击即测」展示 A 这一跳收到的头）
   if (url.pathname === '/aiapi/echo-headers') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     console.log('[echo-a]', JSON.stringify({ path: '/aiapi/echo-headers', identity }))
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({

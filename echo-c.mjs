@@ -30,35 +30,36 @@
  * 运行：node echo-c.mjs（PORT 默认 8080）
  * ═══════════════════════════════════════════════════════════════════════ */
 import http from 'node:http'
+import { fetchUserInfo, extractAccessToken, claimsToIdentity } from './userinfo.js'
 
 const PORT = Number(process.env.PORT || 8080)
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】中文 header 乱码修复（与 echo-server / echo-b 同源）
+ * 【对接代码】读网关注入的身份头（ASCII 字段）+ 调 UserInfo 拿中文姓名
+ * ───────────────────────────────────────────────────────────────────────
+ * 公司统一约定的「身份透传规范」（详见 userinfo.js 顶部注释）：
+ *   · ASCII 字段（username/email/phone/员工编号/sub）→ 读 X-User-* 头，零查询；
+ *   · 中文姓名（name/given_name/family_name）→ 用 access token 调 UserInfo
+ *     拿干净 UTF-8，不再 unMojibake 反解码。
  * ═══════════════════════════════════════════════════════════════════════ */
-function unMojibake(v) {
-  if (v == null) return null
-  try {
-    return Buffer.from(String(v), 'latin1').toString('utf8')
-  } catch {
-    return v
-  }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- * 【对接代码】读网关注入的身份头（这是接入认证唯一要写的核心代码）
- * 与 echo-b / echo-server 的 collectIdentity 完全一致。
- * ═══════════════════════════════════════════════════════════════════════ */
-function collectIdentity(req) {
-  return {
+async function collectIdentity(req) {
+  const fromHeaders = {
     username: req.headers['x-user-username'] ?? null,
-    name: unMojibake(req.headers['x-user-name']),
     email: req.headers['x-user-email'] ?? null,
     phone: req.headers['x-user-phone'] ?? null,
     employeeNo: req.headers['x-user-employee-no'] ?? null,
-    givenName: unMojibake(req.headers['x-user-given-name']),
-    familyName: unMojibake(req.headers['x-user-family-name']),
     sub: req.headers['x-user-sub'] ?? null,
+  }
+  const info = claimsToIdentity(await fetchUserInfo(extractAccessToken(req)))
+  return {
+    username: fromHeaders.username ?? info.username ?? null,
+    name: info.name ?? null,
+    email: fromHeaders.email ?? info.email ?? null,
+    phone: fromHeaders.phone ?? info.phone ?? null,
+    employeeNo: fromHeaders.employeeNo ?? info.employeeNo ?? null,
+    givenName: info.givenName ?? null,
+    familyName: info.familyName ?? null,
+    sub: fromHeaders.sub ?? info.sub ?? null,
   }
 }
 
@@ -119,7 +120,7 @@ function collectHeaders(req) {
 /* ═══════════════════════════════════════════════════════════════════════
  * 【业务代码】HTTP 服务器主干
  * ═══════════════════════════════════════════════════════════════════════ */
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
 
   if (url.pathname === '/health') {
@@ -130,7 +131,7 @@ const server = http.createServer((req, res) => {
 
   // 链式末端身份回显（/aiapi/me 与 / 同义，供上游 B 透传调用）
   if (url.pathname === '/' || url.pathname === '/aiapi/me') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     console.log('[echo-c]', JSON.stringify({ path: url.pathname, identity }))
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(render(identity))
@@ -139,7 +140,7 @@ const server = http.createServer((req, res) => {
 
   // 完整回显实际收到的请求头（给页面「点击即测」展示 C 这一跳收到的头）
   if (url.pathname === '/aiapi/echo-headers') {
-    const identity = collectIdentity(req)
+    const identity = await collectIdentity(req)
     console.log('[echo-c]', JSON.stringify({ path: url.pathname, identity }))
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({
