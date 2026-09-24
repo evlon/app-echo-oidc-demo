@@ -1,62 +1,46 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# echo-b —— 「身份透传」链路第二跳（中间跳：读身份头 + 透传 JWT 调 echo-c）
+# echo-c —— 「身份透传」链路第三跳（链式末端服务）
 #
-# echo-b 现在不是末端，而是中间跳：它读网关注入的 X-User-* 头知道「我是谁」，
-# 同时把原始 JWT 透传给网关的 demo-c 域名，让 C 这一跳也由网关重新验签。
+# echo-c 是「A → B → C」链式透传的末端：它只读网关注入的 X-User-* 头，
+# 返回「我知道你是谁（第三跳）」。它不往下调，所以不需要 hostAliases / CA 挂载。
 #
-# ⚠️ K8S Service 名字必须叫 demo-b（匹配路由 backend k8s-demo-b）。
+# ⚠️ K8S Service 名字必须叫 demo-c（匹配路由 backend k8s-demo-c）。
 # ══════════════════════════════════════════════════════════════════════════════
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: demo-b
+  name: demo-c
   namespace: default
   labels:
-    app: demo-b
+    app: demo-c
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: demo-b
+      app: demo-c
   template:
     metadata:
       labels:
-        app: demo-b
+        app: demo-c
     spec:
       tolerations:
         - operator: Exists
-      # ⭐ echo-b 要调 echo-c（https://demo-c.example.com），Pod 内 DNS 不认
-      #   对外域名，需 hostAliases 映射到 edge-gateway 的 ClusterIP（同 echo-a 调 demo-b）。
-      hostAliases:
-        - ip: "10.0.0.10"
-          hostnames:
-            - "demo-c.example.com"
       containers:
-        - name: demo-b
+        - name: demo-c
           image: registry.example.com/library/echo-oidc-demo:20260924-aiapi3hop
           imagePullPolicy: IfNotPresent
-          # 启动 echo-b.mjs（多服务共用一个镜像，用 command 选择）
-          command: ["node", "echo-b.mjs"]
+          # 启动 echo-c.mjs（多服务共用一个镜像，用 command 选择）
+          command: ["node", "echo-c.mjs"]
           ports:
             - name: http
               containerPort: 8080
           env:
             - name: PORT
               value: "8080"
-            # ⭐ 下一跳走网关（demo-c 的对外域名），由网关重新验签注入身份
-            - name: ECHO_C_URL
-              value: "https://demo-c.example.com/aiapi/me"
             - name: TZ
               value: "Asia/Shanghai"
-            # ⭐ 内网自签证书 → 让 Node 信任企业根证书（否则 fetch https 报错）
-            - name: NODE_EXTRA_CA_CERTS
-              value: "/etc/ssl/ca/company-root-ca.pem"
-          volumeMounts:
-            - name: ca
-              mountPath: /etc/ssl/ca
-              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -77,21 +61,17 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-      volumes:
-        - name: ca
-          configMap:
-            name: company-root-ca
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: demo-b
+  name: demo-c
   namespace: default
   labels:
-    app: demo-b
+    app: demo-c
 spec:
   selector:
-    app: demo-b
+    app: demo-c
   ports:
     - name: http
       port: 80

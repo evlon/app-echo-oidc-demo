@@ -5,10 +5,11 @@
 # 原生构建 arm64（本机是 x86_64 / 节点是 aarch64，且节点无出公网，
 # 基础镜像必须先入内网镜像仓库）。
 #
-# ── 三个服务共用一个镜像 ──────────────────────────────────────────────────
+# ── 四个服务共用一个镜像 ──────────────────────────────────────────────────
 #   echo-server.mjs  —— 单跳身份回显（原示例，端口 8080）
 #   echo-a.mjs       —— 身份透传第一跳（入口，调 echo-b）
-#   echo-b.mjs       —— 身份透传第二跳（被调，读网关注入身份）
+#   echo-b.mjs       —— 身份透传第二跳（中间跳，透传调 echo-c）
+#   echo-c.mjs       —— 身份透传第三跳（链式末端，读网关注入身份）
 #   通过容器启动命令（deployment 里的 command）选择跑哪个服务。
 #
 # ── 基础镜像 ──────────────────────────────────────────────────────────────
@@ -32,9 +33,10 @@ WORKDIR /app
 COPY echo-server.mjs    /app/echo-server.mjs
 COPY echo-a.mjs         /app/echo-a.mjs
 COPY echo-b.mjs         /app/echo-b.mjs
+COPY echo-c.mjs         /app/echo-c.mjs
 COPY package.json       /app/package.json
 
 EXPOSE 8080
 
-# 默认跑单跳 echo-server；echo-a / echo-b 由 deployment 的 command 覆盖
+# 默认跑单跳 echo-server；echo-a / echo-b / echo-c 由 deployment 的 command 覆盖
 CMD ["node", "echo-server.mjs"]

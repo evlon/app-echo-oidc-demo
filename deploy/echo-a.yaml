@@ -43,7 +43,7 @@ spec:
             - "demo-b.example.com"
       containers:
         - name: demo-a
-          image: registry.example.com/library/echo-oidc-demo:20260923-s1s2
+          image: registry.example.com/library/echo-oidc-demo:20260924-aiapi3hop
           imagePullPolicy: IfNotPresent
           # 启动 echo-a.mjs（多服务共用一个镜像，用 command 选择）
           command: ["node", "echo-a.mjs"]
@@ -55,7 +55,7 @@ spec:
               value: "8080"
             # ⭐ 第二跳走网关（demo-b 的对外域名），由网关重新验签注入身份
             - name: ECHO_B_URL
-              value: "https://demo-b.example.com/api/me"
+              value: "https://demo-b.example.com/aiapi/me"
             - name: TZ
               value: "Asia/Shanghai"
             # ⭐ 内网自签证书 → 让 Node 信任企业根证书（否则 fetch https 报错）

@@ -2,8 +2,8 @@
 # ============================================================================
 # 构建 echo-oidc-demo 镜像并推送到内网镜像仓库（在 K8S 节点原生构建 arm64）
 #
-# 纯 Node ESM 零依赖 → 直接打包三个 .mjs + package.json 即可。
-# 一个镜像同时承载 echo-server / echo-a / echo-b 三个服务，
+# 纯 Node ESM 零依赖 → 直接打包四个 .mjs + package.json 即可。
+# 一个镜像同时承载 echo-server / echo-a / echo-b / echo-c 四个服务，
 # 由 deployment 的 command 决定跑哪个。
 #
 # ── 用法 ───────────────────────────────────────────────────────────────────
@@ -27,6 +27,7 @@ mkdir -p "$STAGE"
 cp    "$DEMO_DIR/echo-server.mjs" "$STAGE/"
 cp    "$DEMO_DIR/echo-a.mjs"      "$STAGE/"
 cp    "$DEMO_DIR/echo-b.mjs"      "$STAGE/"
+cp    "$DEMO_DIR/echo-c.mjs"      "$STAGE/"
 cp    "$DEMO_DIR/package.json"    "$STAGE/"
 cp    "$DEMO_DIR/Dockerfile"      "$STAGE/"
 

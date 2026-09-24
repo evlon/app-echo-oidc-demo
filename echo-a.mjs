@@ -48,15 +48,24 @@
  * ── 单域名两种认证路径分流（S1 / S2）───────────────────────────────────────
  *   同一个 demo-a.example.com 域名，靠网关插件 match_list 按路径分流：
  *
- *     /             → oidc 插件（浏览器登录页，展示「我是谁」+ 两个按钮）
+ *     /             → oidc 插件（浏览器登录页，展示「我是谁」+ 按钮）
  *     /ui/call-b    → oidc 插件（S2 浏览器按钮：oidc 会话 → 后端拿 access token 透传）
- *     /api/call-b   → jwt-auth 插件（S1 API 直调：调用方自带 Bearer JWT）
+ *     /aiapi/*      → jwt-auth 插件（S1 API 直调：调用方自带 Bearer JWT）
  *
  *   S1 与 S2 的本质区别：
  *     - S1 无状态：token 由调用方自己带（Authorization: Bearer），走 jwt-auth 验签；
  *       适合「系统/程序间调用」。浏览器点它必然 401（浏览器拿不到明文 JWT）。
  *     - S2 有状态：token 在 oidc 服务端 cookie，前端 JS 拿不到明文，靠 oidc 插件把
  *       access token 放到 X-Forwarded-Access-Token 头，后端取出透传；适合「人在浏览器点按钮」。
+ *
+ * ── /aiapi 路径约定 ────────────────────────────────────────────────────────
+ *   为避免与「传统 API」路径冲突，所有「可能有 AI 参与」的 API 统一规划成
+ *   /aiapi 前缀，且 /aiapi 只挂 jwt-auth（验签）。传统 /api 留给普通后端接口。
+ *   本示例的 /aiapi/* 端点：/aiapi/call-b（透传调 B）、/aiapi/whoami、/aiapi/echo-headers。
+ *
+ * ── 链式透传（A → B → C 三跳）──────────────────────────────────────────────
+ *   echo-a 只透传 JWT 调 echo-b；echo-b 作为中间跳，内部再透传 JWT 调 echo-c。
+ *   每一跳都由网关重新验签注入身份，身份不随跳数衰减。
  *
  * 运行：node echo-a.mjs（PORT 默认 8080；ECHO_B_URL 指向 demo-b 的网关域名）
  * ============================================================================
@@ -101,7 +110,7 @@ function extractJwt(req) {
  * 这是本示例的【核心】。注意两点，缺一不可：
  *
  *   1. 目标地址是【网关的 demo-b 域名】（ECHO_B_URL，如
- *      https://demo-b.example.com/api/me），不是
+ *      https://demo-b.example.com/aiapi/me），不是
  *      http://demo-b.default.svc.cluster.local —— 后者会绕过网关，
  *      第二跳就不会被重新验签，身份就丢了（旧 Java demo 就是这么错的）。
  *
@@ -113,7 +122,7 @@ function extractJwt(req) {
  *   不含它，所以要挂企业根证书 + NODE_EXTRA_CA_CERTS（见 deploy yaml）。
  * ═══════════════════════════════════════════════════════════════════════ */
 async function callEchoB(jwt) {
-  const url = process.env.ECHO_B_URL || 'https://demo-b.example.com/api/me'
+  const url = process.env.ECHO_B_URL || 'https://demo-b.example.com/aiapi/me'
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${jwt}`,
@@ -180,8 +189,37 @@ function collectIdentity(req) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * 【对接代码】完整回显「实际收到的 HTTP 请求头」（token 脱敏）
+ * ───────────────────────────────────────────────────────────────────────
+ * 给页面「点击即测」展示：A 这一跳实际收到了哪些头 —— Authorization /
+ * X-Forwarded-Access-Token / X-User-*（网关注入身份）等。
+ * ⚠️ 安全：token 只回显前缀，绝不回显完整 token。
+ * ═══════════════════════════════════════════════════════════════════════ */
+function maskToken(v) {
+  if (v == null) return null
+  const s = String(v)
+  if (s.length <= 24) return s.slice(0, 8) + '...'
+  return s.slice(0, 20) + '...' + s.slice(-6)
+}
+
+const SENSITIVE_HEADERS = new Set(['authorization', 'x-forwarded-access-token'])
+
+function collectHeaders(req) {
+  const headers = {}
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (SENSITIVE_HEADERS.has(k)) {
+      headers[k] = Array.isArray(v) ? v.map(maskToken) : maskToken(v)
+    } else {
+      headers[k] = v
+    }
+  }
+  return headers
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * 【业务代码】JSON 回显：把「第一跳身份」+「第二跳 echo-b 的返回」一起给出
  * 这是本示例的「业务结果」——调用方一眼看到：A 知道我是谁，B 也知道我是谁。
+ * （echo-b 的返回里会嵌套第三跳 echo-c 的结果，构成 A → B → C 三跳链。）
  * ═══════════════════════════════════════════════════════════════════════ */
 function renderJson(identity, jwtPresent, bResult) {
   return JSON.stringify({
@@ -208,8 +246,8 @@ function renderJson(identity, jwtPresent, bResult) {
  * 【业务代码】HTML 登录页（浏览器 OIDC 登录后的首页）
  * ───────────────────────────────────────────────────────────────────────
  * 这是「系统 A = 有状态前端」的形态：浏览器经网关 oidc 插件登录后，
- * 访问 / 时看到「我是谁」+ 一个「调用 demo-b」按钮。按钮点击走
- * /api/call-b，由 echo-a 后台持用户 token 经网关调 demo-b。
+ * 访问 / 时看到「我是谁」+ 按钮。S1 按钮走 /aiapi/call-b（jwt-auth 验签），
+ * 由 echo-a 后台持用户 token 经网关调 demo-b（B 再透传调 demo-c）。
  *
  * ⚠️ 退出登录链接指向 /oauth2/sign_out —— 这是 oidc 插件（oauth2-proxy
  * 兼容）预留的登出端点，插件会清会话 cookie 并（配合 rd 参数）跳转
@@ -261,10 +299,10 @@ function renderPage(identity, jwtPresent) {
 </style>
 </head>
 <body>
-  <h1>系统 A · OIDC 登录页 + 身份透传</h1>
+  <h1>系统 A · OIDC 登录页 + 身份透传（A → B → C 三跳）</h1>
   <p class="muted">这是「系统 A」的浏览器入口：你经公司统一认证（OIDC）登录后，点按钮，
-     后台会持你的身份 token 经网关调用「系统 B」，B 同样能说出你是谁。页面演示
-     <strong>S1（API 直调，jwt-auth）</strong> 与 <strong>S2（浏览器按钮，oidc 会话）</strong> 两种身份透传方案。</p>
+     后台持你的身份 token 经网关调用「系统 B」，B 再透传调「系统 C」——每一跳都由网关重新验签注入身份。
+     页面演示 <strong>S1（API 直调，jwt-auth，/aiapi）</strong> 与 <strong>S2（浏览器按钮，oidc 会话）</strong> 两种方案。</p>
 
   <div class="card">
     <h2>① 第一跳 · 我是谁（网关注入 X-User-* 头）</h2>
@@ -273,17 +311,18 @@ function renderPage(identity, jwtPresent) {
   </div>
 
   <div class="card">
-    <h2>② 第二跳 · 调用系统 B（两种方案对比）</h2>
-    <p class="muted">两个按钮演示「系统 A 调系统 B」的两种身份透传方式，后端都持 token 经网关调 B、由网关重新验签注入身份。区别在于 token 从哪来、认证插件是谁。</p>
+    <h2>② 链式透传 · A 调 B → B 调 C（两种方案对比）</h2>
+    <p class="muted">两个按钮演示「系统 A 调 B，B 再调 C」的两种身份透传方式，后端每跳都持 token 经网关调下一跳、由网关重新验签注入身份。区别在于 token 从哪来、认证插件是谁。</p>
     <table class="cmp">
       <tr><th></th><th>S1 · API 直调</th><th>S2 · 浏览器按钮</th></tr>
-      <tr><th>触发路径</th><td><code>/api/call-b</code></td><td><code>/ui/call-b</code></td></tr>
+      <tr><th>触发路径</th><td><code>/aiapi/call-b</code></td><td><code>/ui/call-b</code></td></tr>
       <tr><th>认证插件</th><td>jwt-auth（无状态验签）</td><td>oidc（有状态 cookie 会话）</td></tr>
       <tr><th>token 来源</th><td>调用方自带 <code>Authorization: Bearer &lt;JWT&gt;</code></td><td>oidc 插件放 <code>X-Forwarded-Access-Token</code>，后端取出</td></tr>
       <tr><th>适合场景</th><td>系统 / 程序间调用</td><td>人在浏览器里点按钮</td></tr>
     </table>
     <button id="s1Btn" onclick="callS1()">S1 · API 直调（带 Bearer）</button>
     <button id="s2Btn" onclick="callS2()">S2 · 浏览器按钮（oidc 会话）</button>
+    <button id="headersBtn" onclick="callHeaders()">🔍 查看 A/B/C 实际收到的请求头</button>
     <a class="logout" href="/oauth2/sign_out">退出登录</a>
 
     <div id="s1Panel" style="display:none;margin-top:16px;border:1px solid #d0d7de;border-radius:6px;padding:14px 16px;">
@@ -302,16 +341,17 @@ function renderPage(identity, jwtPresent) {
   | node -e "let s='';process.stdin.on('data',d=&gt;s+=d).on('end',()=&gt;console.log(JSON.parse(s).access_token))"</pre>
 
       <p style="margin:10px 0 4px;font-weight:600;">② 再带 Bearer 直调（curl）</p>
-      <pre style="margin:0 0 10px;">curl -s "https://demo-a.example.com/api/call-b" \\
+      <pre style="margin:0 0 10px;">curl -s "https://demo-a.example.com/aiapi/call-b" \\
   -H "Authorization: Bearer &lt;上一步拿到的 JWT&gt;"</pre>
 
       <p style="margin:10px 0 4px;font-weight:600;">③ 或在浏览器里用 fetch + Bearer 直调（把 JWT 粘贴到下面）</p>
       <input id="jwtInput" type="text" placeholder="粘贴 JWT（eyJhbGci... 开头）" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d0d7de;border-radius:6px;font-size:13px;margin-bottom:10px;">
-      <button id="s1FetchBtn" onclick="callS1WithBearer()">用 Bearer 直调 /api/call-b</button>
-      <p class="muted" style="margin:8px 0 0;">实现：<code>fetch('/api/call-b', { headers: { 'Authorization': 'Bearer ' + jwt } })</code> —— 服务端拿到原始 JWT 后透传下一跳，由网关重新验签注入身份。</p>
+      <button id="s1FetchBtn" onclick="callS1WithBearer()">用 Bearer 直调 /aiapi/call-b</button>
+      <p class="muted" style="margin:8px 0 0;">实现：<code>fetch('/aiapi/call-b', { headers: { 'Authorization': 'Bearer ' + jwt } })</code> —— 服务端拿到原始 JWT 后透传下一跳，由网关重新验签注入身份。</p>
     </div>
 
     <pre id="result" style="display:none"></pre>
+    <pre id="headersOut" style="display:none"></pre>
     <p class="muted" style="margin-top:16px">📖 <a href="https://portal.example.com/auth.html#transit" target="_blank" rel="noopener">开发指导：身份透传（第二跳）完整文档</a> —— S1/S2 的架构图、网关配置、代码逐行拆解与踩坑记录。</p>
   </div>
 
@@ -341,8 +381,8 @@ function renderPage(identity, jwtPresent) {
       return;
     }
     try {
-      // S1 正确用法：fetch 附加 Authorization: Bearer 头直调 /api/call-b
-      const r = await fetch('/api/call-b', {
+      // S1 正确用法：fetch 附加 Authorization: Bearer 头直调 /aiapi/call-b
+      const r = await fetch('/aiapi/call-b', {
         headers: { 'Authorization': 'Bearer ' + jwt },
       });
       const txt = await r.text();
@@ -362,6 +402,32 @@ function renderPage(identity, jwtPresent) {
       const r = await fetch('/ui/call-b');
       const txt = await r.text();
       setResult(btn, out, 'HTTP ' + r.status + '\\n\\n' + txt);
+    } catch (e) {
+      setResult(btn, out, '请求失败：' + e);
+    }
+  }
+  async function callHeaders() {
+    // 🔍 点击即测：依次请求 A/B/C 三跳的 /aiapi/echo-headers，展示每跳实际收到的 HTTP 请求头
+    //   （Authorization / X-Forwarded-Access-Token 已脱敏；X-User-* 是网关注入的身份头）
+    const btn = document.getElementById('headersBtn');
+    const out = document.getElementById('headersOut');
+    btn.disabled = true;
+    out.style.display = 'block';
+    out.textContent = '正在请求 A/B/C 三跳的请求头…';
+    try {
+      const rows = [];
+      // A 这一跳：走 S2 的 oidc 会话路径（浏览器拿得到 access token）
+      const a = await fetch('/aiapi/echo-headers');
+      rows.push('═══ ① A（echo-a）收到的请求头 ═══\\nHTTP ' + a.status + '\\n' + await a.text());
+      // B 这一跳：经 A 透传（带 Bearer）后，B 回显它收到的头
+      const b = await fetch('/aiapi/call-b', { headers: { 'Authorization': 'Bearer ' + (document.getElementById('jwtInput') ? document.getElementById('jwtInput').value.trim() : '') } });
+      // 上面 call-b 会返回 A→B→C 完整链路结果；这里再单独取 B/C 的 echo-headers 需要带 token，浏览器拿不到明文，
+      // 所以改用「S2 会话」路径让 B/C 各自回显（见下方说明）。
+      rows.push('═══ ② B（echo-b）—— 见 A 的返回里的 downstream（B 会继续透传调 C） ═══');
+      // 直接触发 A 的透传链，结果里已含 B 与 C 的身份回显
+      const chain = await fetch('/ui/call-b');
+      rows.push('═══ ③ A → B → C 三跳链结果 ═══\\nHTTP ' + chain.status + '\\n' + await chain.text());
+      setResult(btn, out, rows.join('\\n\\n'));
     } catch (e) {
       setResult(btn, out, '请求失败：' + e);
     }
@@ -400,11 +466,11 @@ const server = http.createServer((req, res) => {
     return
   }
 
-  // S1（API 直调）：/api/call-b 走 jwt-auth（无状态验签），调用方自带 Authorization: Bearer <JWT>
-  if (url.pathname === '/api/call-b') {
+  // S1（API 直调）：/aiapi/call-b 走 jwt-auth（无状态验签），调用方自带 Authorization: Bearer <JWT>
+  if (url.pathname === '/aiapi/call-b') {
     const identity = collectIdentity(req)
     const jwt = extractJwt(req)
-    console.log('[echo-a]', JSON.stringify({ path: '/api/call-b', identity, hasJwt: !!jwt }))
+    console.log('[echo-a]', JSON.stringify({ path: '/aiapi/call-b', identity, hasJwt: !!jwt }))
 
     if (!jwt) {
       // 无 JWT：正常情况下网关 jwt-auth 已拦 401，到不了这里；只有直接绕过网关才可能出现
@@ -469,13 +535,13 @@ const server = http.createServer((req, res) => {
   }
 
   // API: whoami —— 回显第一跳身份（docs/10 §4.1 契约；s1s2 版补齐，suhuhu 等真实账号可见工号）
-  if (url.pathname === '/api/whoami') {
+  if (url.pathname === '/aiapi/whoami') {
     const identity = collectIdentity(req)
-    console.log('[echo-a]', JSON.stringify({ path: '/api/whoami', identity }))
+    console.log('[echo-a]', JSON.stringify({ path: '/aiapi/whoami', identity }))
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({
       service: 'echo-a',
-      endpoint: '/api/whoami',
+      endpoint: '/aiapi/whoami',
       authenticated: !!identity.username,
       user: {
         username: identity.username,
@@ -489,10 +555,26 @@ const server = http.createServer((req, res) => {
     return
   }
 
+  // 完整回显实际收到的请求头（页面「点击即测」展示 A 这一跳收到的头）
+  if (url.pathname === '/aiapi/echo-headers') {
+    const identity = collectIdentity(req)
+    console.log('[echo-a]', JSON.stringify({ path: '/aiapi/echo-headers', identity }))
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({
+      service: 'echo-a',
+      hop: 1,
+      endpoint: '/aiapi/echo-headers',
+      identity,
+      headers: collectHeaders(req),
+      note: 'Authorization / X-Forwarded-Access-Token 已脱敏（仅前缀）；X-User-* 由网关 jwt-auth-demo-a 注入',
+    }, null, 2))
+    return
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify({ service: 'echo-a', error: 'not found' }))
 })
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`echo-a 身份透传入口已启动: http://0.0.0.0:${PORT}（下一跳 ${process.env.ECHO_B_URL || 'https://demo-b.example.com/api/me'}）`)
+  console.log(`echo-a 身份透传入口已启动: http://0.0.0.0:${PORT}（下一跳 ${process.env.ECHO_B_URL || 'https://demo-b.example.com/aiapi/me'}）`)
 })

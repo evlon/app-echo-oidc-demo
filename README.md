@@ -100,38 +100,45 @@ higress-cli create --name echo --domains echo.ai.example.com \
 
 ---
 
-## 五、进阶：身份透传（第二跳）
+## 五、进阶：身份透传（第二跳 + 链式多跳）
 
 上面讲的是**单跳**——客户端直接调你的服务。真实业务常有**服务间调用**：
-`客户端 → 网关 → 服务 A → 服务 B`，此时 B 怎么知道「你是谁」？
+`客户端 → 网关 → 服务 A → 服务 B → 服务 C`，此时 B、C 怎么知道「你是谁」？
 
-**正确姿势**：A 把原始 JWT 透传给网关，由网关对 B 这一跳重新验签注入身份（**不是** A 手动复制身份头）。
+**正确姿势**：每一跳都把原始 JWT 透传给网关，由网关对下一跳重新验签注入身份（**不是** 手动复制身份头）。跳数再多规则不变。
+
+> **/aiapi 路径约定**：所有「可能有 AI 参与」的 API 统一 `/aiapi` 前缀、只挂 jwt-auth；传统 `/api` 留给普通后端接口，避免冲突。
 
 | 服务 | 文件 | 说明 |
 |---|---|---|
-| 第一跳（入口） | `echo-a.mjs` | 读原始 JWT（需网关 `keep_token: true`）→ 透传 JWT 调网关的下游域名；**另有浏览器 OIDC 登录页 + 「调用 demo-b」按钮** |
-| 第二跳（被调） | `echo-b.mjs` | = 单跳 echo-server，读网关注入的 `X-User-*` 头即可 |
+| 第一跳（入口） | `echo-a.mjs` | 读原始 JWT（`keep_token: true`）→ 透传 JWT 调网关的下游域名；另有浏览器 OIDC 登录页 + S1/S2 按钮 + header 回显 |
+| 第二跳（中间跳） | `echo-b.mjs` | 读网关注入的 `X-User-*` 头 + 透传 JWT 调 echo-c（`keep_token: true`）|
+| 第三跳（链式末端） | `echo-c.mjs` | = 单跳 echo-server，只读网关注入的 `X-User-*` 头 |
+
+每个服务都暴露 `/aiapi/echo-headers` 端点，回显**实际收到的 HTTP 请求头**（token 脱敏），供「点击即测」直观展示。
 
 完整讲解见 `docs/认证接入/07-身份透传-第二跳.md`（含架构图、逐行注释、踩坑记录）。
 
 **线上体验**：
 - **浏览器（系统 A 登录页）**：<https://demo-a.example.com> —— 经公司统一认证（OIDC）登录后，
-  看到「我是谁」页面 + 「调用 demo-b」按钮，点按钮后台持身份 token 经网关调 demo-b，B 也能说出你是谁。
-- **API（纯 JWT）**：<https://demo-a.example.com/api/call-b> —— 带 JWT 访问，返回身份透传 JSON。
+  看到「我是谁」页面 + S1/S2 按钮 + 「查看 A/B/C 实际收到的请求头」按钮。
+- **API（纯 JWT）**：<https://demo-a.example.com/aiapi/call-b> —— 带 JWT 访问，返回 A→B→C 三跳身份透传 JSON。
 
 ### 系统 A 的「有状态前端」形态（OIDC 登录页 + 按钮）
 
-`echo-a.mjs` 除了原有的 `/api/call-b`（透传 JWT），还新增了**浏览器登录页**：
+`echo-a.mjs` 除了 API 透传，还提供**浏览器登录页**：
 
 | 路由 | 行为 |
 |---|---|
-| `/` | 渲染 HTML 页面：显示「我是谁」（网关注入 `X-User-*`）+ S1/S2 双按钮 + 退出登录 |
-| `/api/whoami` | 回显第一跳身份（`emp_no` 工号 / `name` / `email` / `sub`），用于真实账号验证身份不衰减 |
-| `/api/call-b` | 按钮点击后调用，透传 JWT 调 demo-b，返回身份透传 JSON |
+| `/` | 渲染 HTML 页面：显示「我是谁」+ S1/S2 按钮 + header 回显按钮 + 退出登录 |
+| `/aiapi/whoami` | 回显第一跳身份（`emp_no` / `name` / `email` / `sub`）|
+| `/aiapi/call-b` | S1 API 直调（带 Bearer JWT），透传调 echo-b → B 再调 echo-c，返回三跳 JSON |
+| `/aiapi/echo-headers` | 回显第一跳实际收到的请求头（token 脱敏）|
+| `/ui/call-b` | S2 浏览器按钮（oidc 会话），后端取 access token 透传 |
 | `/health` | K8S 探针 |
 
 网关侧配套：demo-a 域名同时挂 **oidc**（浏览器登录，`client_id=demo-a`）+ **jwt-auth**（API 验签）。
-两者靠 oidc 的 `match_list` 豁免 `/api`、`/health` 分流（见 `gateway/oidc-demo-a.json`）。
+两者靠 oidc 的 `match_list` 豁免 `/aiapi`、`/health` 分流。
 
 ---
 
@@ -141,24 +148,22 @@ higress-cli create --name echo --domains echo.ai.example.com \
 app-echo-oidc-demo/
 ├── echo-server.mjs        # 单跳身份回显（业务 + 对接，已逐块标注）
 ├── echo-a.mjs             # 身份透传第一跳（透传 JWT 调下游）
-├── echo-b.mjs             # 身份透传第二跳（读网关注入身份）
-├── verify-transit.mjs     # 端到端验证脚本（本机运行）
+├── echo-b.mjs             # 身份透传第二跳（中间跳，透传 JWT 调 echo-c）
+├── echo-c.mjs             # 身份透传第三跳（链式末端，读网关注入身份）
+├── verify-transit.mjs     # 两跳端到端验证脚本（本机运行）
+├── verify-3hop.mjs        # 三跳端到端验证脚本（本机运行）
 ├── package.json
-├── Dockerfile             # 打镜像（一个镜像承载三个服务）
+├── Dockerfile             # 打镜像（一个镜像承载四个服务）
 ├── build.sh               # 构建 + 推送镜像仓库
-├── deploy/
-│   ├── echo-server.yaml   # 单跳 K8S Deployment + Service
-│   ├── echo-a.yaml        # 第一跳（含 hostAliases 坑）
-│   └── echo-b.yaml        # 第二跳
-├── gateway/
-│   ├── jwt-auth-echo-a.json      # 第一跳网关配置（keep_token:true）
-│   ├── jwt-auth-echo-b.json      # 第二跳网关配置
-│   ├── jwt-auth-demo-a-keep-token.json  # 实际应用的（复用旧 demo-a 插件名）
-│   ├── jwt-auth-demo-a-s1.json   # S1 路径 jwt-auth（无 keep_token，用于演示 401 教学点）
-│   ├── oidc-demo-a.json          # demo-a 浏览器登录（oidc，match_list 豁免 /api、/health）
-│   └── oidc-demo-a-s1s2.json     # S1/S2 双按钮版 oidc 配置
-└── README.md              # 本文件
+└── deploy/
+    ├── echo-server.yaml   # 单跳 K8S Deployment + Service
+    ├── echo-a.yaml        # 第一跳（含 hostAliases 坑）
+    ├── echo-b.yaml        # 第二跳（中间跳，含 ECHO_C_URL + hostAliases）
+    └── demo-c.yaml        # 第三跳（链式末端）
 ```
+
+> 网关插件配置（jwt-auth-demo-a/b/c、oidc-demo-a）不在本仓库——它们含真实密钥/域名，
+> 由 `k8s/scripts/deploy-demo-aiapi-3hop.py` 在节点上经 apiserver CRD 生成。
 
 配套文档（上级目录）：
 - `docs/认证接入/00-总览-整体情况.md` —— 架构图 / 时序图 / 价值
